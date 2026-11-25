@@ -2440,9 +2440,24 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 static GPU_WRITTEN_CBV_PAGES: std::sync::RwLock<Option<std::collections::HashSet<usize>>> =
     std::sync::RwLock::new(None);
 static GPU_WRITTEN_CBV_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GPU_WRITTEN_CBV_EXACT: std::sync::RwLock<Option<std::collections::HashSet<(usize, usize)>>> =
+    std::sync::RwLock::new(None);
+static GPU_WRITTEN_CBV_EXACT_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn note_gpu_written_cbv_page(src: usize, len: usize) {
-    if len == 0 || len > 512 {
+    if len == 0 || len > 4096 {
+        return;
+    }
+    if len > 512 {
+        // Exact (address, len) match for medium GPU-written CBVs (e.g. 3424 B
+        // buffer populated by gpu_copy_buffer): zero false positives on other
+        // large CBVs in the same 64 KiB page.
+        let mut exact = GPU_WRITTEN_CBV_EXACT.write().unwrap_or_else(|e| e.into_inner());
+        let exact = exact.get_or_insert_with(std::collections::HashSet::new);
+        if exact.len() < 128 && exact.insert((src, len)) {
+            GPU_WRITTEN_CBV_EXACT_COUNT.store(exact.len(), Ordering::Relaxed);
+        }
         return;
     }
     // Learn 64 KiB pages (`>> 16`) strictly for small (<= 512 B, e.g. 480 B)
@@ -2466,7 +2481,19 @@ pub(crate) fn note_gpu_written_cbv_page(src: usize, len: usize) {
 }
 
 pub(crate) fn is_gpu_written_cbv_page(address: u64, len: u64) -> bool {
-    if len == 0 || len > 512 || GPU_WRITTEN_CBV_COUNT.load(Ordering::Relaxed) == 0 {
+    if len == 0 || len > 4096 {
+        return false;
+    }
+    if len > 512 {
+        if GPU_WRITTEN_CBV_EXACT_COUNT.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let exact = GPU_WRITTEN_CBV_EXACT.read().unwrap_or_else(|e| e.into_inner());
+        return exact
+            .as_ref()
+            .is_some_and(|s| s.contains(&(address as usize, len as usize)));
+    }
+    if GPU_WRITTEN_CBV_COUNT.load(Ordering::Relaxed) == 0 {
         return false;
     }
     let first = (address as usize) >> 16;
@@ -2594,10 +2621,18 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
-        // settle is still due where that could not be done. At most this
-        // many changed runs go up to copies in the card's memory, each a
-        // copy of its own there.
-        let mut runs_left = 512;
+        // settle is still due where that could not be done. Raised from 512 to
+        // 4096 (configurable via `VICTORY_MERGE_RUNS`): structured 64 KiB pages
+        // in carded GPU heaps easily exceed 512 byte-diff runs, and 4096 GPU
+        // CopyBufferRegion sub-copies cost <2 ms vs a 35 ms full pipeline settle.
+        static MERGE_RUNS: OnceLock<usize> = OnceLock::new();
+        let mut runs_left = *MERGE_RUNS.get_or_init(|| {
+            std::env::var("VICTORY_MERGE_RUNS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 64)
+                .unwrap_or(4096)
+        });
         return spans.iter().any(|(shadow, from, to)| {
             let blocked = shadow.merge_under_writes(*from, *to - *from, &mut runs_left);
             if blocked {
@@ -5898,20 +5933,17 @@ impl HostList {
     }
 
     /// Offloads a title `CopyBufferRegion` onto the GPU when `src` or `dst` is
-    /// written by an in-flight shader (`VICTORY_GPU_COPY_BUFFER=1`, default on).
-    /// Eliminates the ~50-76 ms/frame `Step::Copy` CPU-GPU settle stall while
-    /// preserving exact title-RAM coherency via `dst_shadow.gpu_writes`.
+    /// written by an in-flight shader OR backed by a carded VRAM buffer
+    /// (`VICTORY_GPU_COPY_BUFFER=1`, default on).
+    /// Checking `carded()` in addition to `flights_write()` catches copies
+    /// recorded before the shader command list writing the 174 MiB carded GPU
+    /// heap is submitted, eliminating the ~59-86 ms/frame `Step::Copy` settle.
     pub(crate) fn gpu_copy_buffer(&self, dst_addr: u64, src_addr: u64, len: u64) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPY_BUFFER").is_none_or(|v| v != "0")) {
             return false;
         }
         if len == 0 || !late() {
-            return false;
-        }
-        let src_in_flight = flights_write(src_addr as usize, (src_addr + len) as usize);
-        let dst_in_flight = flights_write(dst_addr as usize, (dst_addr + len) as usize);
-        if !src_in_flight && !dst_in_flight {
             return false;
         }
         let Some(src_shadow) = crate::shadow::find(src_addr, len) else {
@@ -5921,6 +5953,13 @@ impl HostList {
             return false;
         };
         if dst_shadow.is_upload() || std::sync::Arc::ptr_eq(&src_shadow, &dst_shadow) {
+            return false;
+        }
+        let should_offload = src_shadow.carded()
+            || dst_shadow.carded()
+            || flights_write(src_addr as usize, (src_addr + len) as usize)
+            || flights_write(dst_addr as usize, (dst_addr + len) as usize);
+        if !should_offload {
             return false;
         }
         let (Some(src_off), Some(dst_off)) = (src_shadow.offset_in(src_addr), dst_shadow.offset_in(dst_addr)) else {
@@ -6706,7 +6745,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         crate::watch::writing(dst as usize, len);
     }
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = if !title_dst {
+        read_fast(src, dst, len)
+    } else {
+        read(src, dst, len)
+    };
     let moved_us = moved.elapsed().as_micros() as u64;
     if !title_dst {
         COPIES_SUB[2].fetch_add(moved_us, Ordering::Relaxed);
@@ -6795,6 +6838,29 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc"))]
+unsafe extern "C" {
+    fn victory_seh_copy_read(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, len: usize) -> i32;
+}
+
+/// Fast in-process SEH-guarded `memcpy` (`VICTORY_SEH_READ=1`, default on) for
+/// reading title memory into writable host shadow buffers without paying
+/// `ReadProcessMemory` kernel transition overhead (~5 GB/s -> ~30+ GB/s).
+fn seh_read_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEH_READ").is_none_or(|v| v != "0"))
+}
+
+fn read_fast(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    if seh_read_enabled() {
+        // SAFETY: `dst` is writable host memory of `len` bytes; `victory_seh_copy_read`
+        // catches any read access violation / in-page error via Windows SEH and returns 0.
+        return unsafe { victory_seh_copy_read(dst.cast(), src.cast(), len) != 0 };
+    }
+    read(src, dst, len)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
@@ -8249,5 +8315,30 @@ mod fill_on_card_tests {
         // The title's memory was never read: it still holds 0xAA.
         assert!(title[64..1088].iter().all(|&b| b == 0xAA));
         crate::shadow::unregister(resource, start);
+    }
+
+    #[test]
+    fn seh_read_fast_copies_valid_and_recovers_from_uncommitted_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE_SZ: usize = 64 << 10;
+        // Reserve 2 x 64 KiB, commit only the first 64 KiB.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE_SZ, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let first = unsafe { VirtualAlloc(base, PAGE_SZ, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(first, base);
+        let src = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), PAGE_SZ) };
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(31) ^ 0x5A) as u8;
+        }
+        let mut dst = vec![0u8; PAGE_SZ];
+        assert!(read_fast(base.cast::<u8>(), dst.as_mut_ptr(), PAGE_SZ));
+        assert_eq!(dst, src);
+
+        // Reading across into the uncommitted second 64 KiB must return false, not crash.
+        let mut big = vec![0u8; 2 * PAGE_SZ];
+        assert!(!read_fast(base.cast::<u8>(), big.as_mut_ptr(), 2 * PAGE_SZ));
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 }

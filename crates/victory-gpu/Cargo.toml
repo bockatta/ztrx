@@ -19,6 +19,9 @@ victory-shader.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(all(windows, target_env = "msvc"))'.build-dependencies]
+cc = "1.11.3"
+
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
