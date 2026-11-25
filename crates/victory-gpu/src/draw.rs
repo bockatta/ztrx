@@ -468,6 +468,17 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if crate::host::fill_on_card()
+        && crate::host::late()
+        && (shadow.carded()
+            || crate::host::flights_write(address as usize, address as usize + len as usize))
+        && let Some(gpu) = {
+            shadow.refresh(list, address, len);
+            list.card_constants(&shadow, address, len)
+        }
+    {
+        return Some(gpu);
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -1574,8 +1585,14 @@ impl State {
         }
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let budget = if bake && left > 0 {
-            // What a bake may read must be there now: up to 2 GiB.
-            (left, 2 << 30)
+            // Initial character skin/face bakes during load get the full
+            // `bake_ms` / 2 GiB budget; once past the first 16 bakes, cap
+            // mid-world bake passes to 32 ms / 64 MiB so gameplay never stalls.
+            if EARLY_TEXTURE_PASSES[1].load(Ordering::Relaxed) < 16 {
+                (left, 2 << 30)
+            } else {
+                (left.min(32), 64 << 20)
+            }
         } else if first && early_ms > 0 {
             (early_ms, 64 << 20)
         } else {
@@ -2640,8 +2657,9 @@ impl State {
                     Some(View::Constant(address, size))
                         if crate::host::fill_on_card()
                             && crate::host::late()
-                            && crate::host::flights_write(address as usize, address as usize + size as usize)
                             && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && (shadow.carded()
+                                || crate::host::flights_write(address as usize, address as usize + size as usize))
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));
                                 list.card_constants(&shadow, address, u64::from(size))

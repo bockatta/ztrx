@@ -7162,13 +7162,76 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, false)
+    }
+
+    /// A buffer in video memory that the CPU maps through the PCI BAR (a
+    /// GPU upload heap, `D3D12_OPTIONS16`): shaders read it at full VRAM
+    /// speed (~700+ GB/s on RTX 5070 vs ~23 GB/s over PCIe), the CPU writes
+    /// it fast through write-combining, and CPU reads are avoided. Active
+    /// when `VICTORY_GPU_UPLOAD=1` and Resizable BAR is supported.
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        const UPLOAD_BUDGET: u64 = 2 << 30;
+        if !self.gpu_upload() {
+            return None;
+        }
+        let size = size.max(1);
+        if UPLOAD_BYTES.fetch_add(size, Ordering::Relaxed) + size > UPLOAD_BUDGET {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static FULL: std::sync::Once = std::sync::Once::new();
+            FULL.call_once(|| {
+                tracing::info!("host copies past the 2 GiB GPU upload budget go to system memory");
+            });
+            return None;
+        }
+        let made = self.mapped_buffer(size, true);
+        if made.is_none() {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        }
+        made
+    }
+
+    pub(crate) fn gpu_upload(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            if !std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1") {
+                return false;
+            }
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a feature query writing the structure of its size.
+            let known = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+            }
+            .is_ok();
+            let on = known && o.GPUUploadHeapSupported.as_bool();
+            tracing::info!(
+                on,
+                "host copies that shaders only read in GPU upload heaps (VICTORY_GPU_UPLOAD)"
+            );
+            on
+        })
+    }
+
+    fn mapped_buffer(&self, size: u64, upload: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
+        let heap = if upload {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            }
+        } else {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,

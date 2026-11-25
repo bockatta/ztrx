@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// In a GPU upload heap (`VICTORY_GPU_UPLOAD=1`): CPU reads are slow
+    /// over PCI BAR, so `copy_compared` is skipped and shader writes warn.
+    upload: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1749,6 +1752,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            upload: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1776,6 +1780,15 @@ impl Shadow {
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
             return;
+        }
+        if self.upload.load(Ordering::Relaxed) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    "shaders write the copy of a buffer made without unordered access, in upload memory: slow copy-back"
+                );
+            });
         }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
@@ -2538,7 +2551,7 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if from < to && copy_compare() {
+        if from < to && copy_compare() && !self.upload.load(Ordering::Relaxed) {
             return self.copy_compared(from, to);
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
@@ -2817,6 +2830,7 @@ impl Shadow {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    read_only: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -2828,11 +2842,22 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    register_as(resource, start, len, false);
+}
+
+/// [`register`] for a read-only title buffer (`ALLOW_UNORDERED_ACCESS == 0`),
+/// eligible for a GPU upload heap under `VICTORY_GPU_UPLOAD=1`.
+pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
+    register_as(resource, start, len, true);
+}
+
+fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
+            read_only,
         },
     );
 }
@@ -2956,11 +2981,20 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        let host = host()?;
+        let card_copy = card_for(size);
+        let (buffer, data, in_upload) = if card_copy.is_none() && entry.read_only
+            && let Some((b, d)) = host.gpu_upload_buffer(size)
+        {
+            (b, d, true)
+        } else {
+            let (b, d) = host.shared_buffer(size)?;
+            (b, d, false)
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match card_copy {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -2996,6 +3030,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.upload.store(in_upload, Ordering::Relaxed);
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
