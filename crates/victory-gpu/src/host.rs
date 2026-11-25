@@ -3533,13 +3533,6 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
-                    }
-                }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -3548,6 +3541,12 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
+        // Collect each flight's back ranges before consuming `items` (without
+        // deduplicating across flights: `Shadow::copy_back_done` decrements
+        // `Flights` per flight!). Calling `copy_back_done` after `line.written`
+        // is updated and waiters are woken ensures no concurrent refresh sees a
+        // range as free while its merge is still in flight.
+        let mut backs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for item in items {
             match item {
                 Late::Run(flight) => {
@@ -3559,6 +3558,7 @@ impl Host {
                         self.card_done(card);
                     }
                     landed.push((flight.lists, flight.order));
+                    backs.extend(flight.back);
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -3602,6 +3602,10 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        // Release per-flight ranges only after `line.written` is updated and waiters are woken.
+        for (shadow, ranges) in &backs {
+            shadow.copy_back_done(ranges);
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
