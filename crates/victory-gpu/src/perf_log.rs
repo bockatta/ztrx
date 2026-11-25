@@ -171,6 +171,12 @@ pub(crate) struct FrameAgg {
     pub cpu_prep_ms: f64,
     pub cpu_copies_ms: f64,
     pub cpu_copies_mb: f64,
+    pub copies_ask_ms: f64,
+    pub copies_watch_ms: f64,
+    pub copies_rpm_ms: f64,
+    pub copies_sparse_ms: f64,
+    pub copies_sparse_cnt: f64,
+    pub copies_whole_mb: f64,
     pub cpu_tex_ms: f64,
     pub cpu_tex_mb: f64,
     pub cpu_heap_ms: f64,
@@ -244,7 +250,9 @@ pub(crate) fn record_aggregate(agg: &FrameAgg) {
     let line = format!(
         "{{\"ts_ms\":{},\"t_ms\":{},\"level\":\"INFO\",\"event\":\"frame_agg\",\"frame\":{},\"in_world\":{},\
          \"fps_cur\":{:.2},\"fps_avg\":{:.2},\"ms_avg\":{:.2},\"ms_1pct_low\":{:.2},\"fps_1pct_low\":{:.2},\
-         \"cpu_prep_ms\":{:.2},\"cpu_copies_ms\":{:.2},\"cpu_copies_mb\":{:.2},\"cpu_tex_ms\":{:.2},\"cpu_tex_mb\":{:.2},\
+         \"cpu_prep_ms\":{:.2},\"cpu_copies_ms\":{:.2},\"cpu_copies_mb\":{:.2},\
+         \"copies_ask_ms\":{:.2},\"copies_watch_ms\":{:.2},\"copies_rpm_ms\":{:.2},\"copies_sparse_ms\":{:.2},\"copies_sparse_cnt\":{:.1},\"copies_whole_mb\":{:.2},\
+         \"cpu_tex_ms\":{:.2},\"cpu_tex_mb\":{:.2},\
          \"cpu_heap_ms\":{:.2},\"cpu_heap_slots_ms\":{:.2},\"cpu_heap_tex_ms\":{:.2},\
          \"gpu_wait_ms\":{:.2},\"copyback_ms\":{:.2},\"copyback_mb\":{:.2},\
          \"draws\":{:.0},\"dropped\":{:.1},\"overlay_us\":{},\"log_us\":{},\
@@ -263,6 +271,12 @@ pub(crate) fn record_aggregate(agg: &FrameAgg) {
         agg.cpu_prep_ms,
         agg.cpu_copies_ms,
         agg.cpu_copies_mb,
+        agg.copies_ask_ms,
+        agg.copies_watch_ms,
+        agg.copies_rpm_ms,
+        agg.copies_sparse_ms,
+        agg.copies_sparse_cnt,
+        agg.copies_whole_mb,
         agg.cpu_tex_ms,
         agg.cpu_tex_mb,
         agg.cpu_heap_ms,

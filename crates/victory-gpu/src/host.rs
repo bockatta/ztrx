@@ -466,6 +466,11 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Sub-breakdown of `PREPARING[0]` (`cpu_copies_ms`) since the last frame line:
+/// `[0]` ask_ahead_us, `[1]` watch_writes_us, `[2]` rpm_bulk_us,
+/// `[3]` sparse_fallback_us, `[4]` sparse_fallback_count, `[5]` whole_unwatched_bytes.
+pub(crate) static COPIES_SUB: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -2498,6 +2503,21 @@ fn blocked_by(
                     if any_written(src, src + len) || any_written(dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            static NAMED_COPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                            if NAMED_COPY.fetch_add(1, Ordering::Relaxed) < 16 {
+                                let src_s = crate::shadow::find(src as u64, len as u64).map(|s| (s.id(), s.span(), s.carded()));
+                                let dst_s = crate::shadow::find(dst as u64, len as u64).map(|s| (s.id(), s.span(), s.carded()));
+                                tracing::info!(
+                                    dst = format_args!("{dst:#x}"),
+                                    src = format_args!("{src:#x}"),
+                                    len,
+                                    src_hit = any_written(src, src + len),
+                                    dst_hit = any_written(dst, dst + len),
+                                    src_copy = ?src_s,
+                                    dst_copy = ?dst_s,
+                                    "XRAY settle: Step::Copy reads/writes what an in-flight shader writes"
+                                );
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -2578,7 +2598,23 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // many changed runs go up to copies in the card's memory, each a
         // copy of its own there.
         let mut runs_left = 512;
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        return spans.iter().any(|(shadow, from, to)| {
+            let blocked = shadow.merge_under_writes(*from, *to - *from, &mut runs_left);
+            if blocked {
+                static NAMED_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if NAMED_STALE.fetch_add(1, Ordering::Relaxed) < 16 {
+                    tracing::info!(
+                        copy_id = shadow.id(),
+                        span = ?shadow.span(),
+                        req = format_args!("{from:#x}..{to:#x}"),
+                        carded = shadow.carded(),
+                        runs_left,
+                        "XRAY settle: WHY_STALE title memory changed under shader writes"
+                    );
+                }
+            }
+            blocked
+        });
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -6463,7 +6499,9 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let ask_us = started.elapsed().as_micros() as u64;
+            COPIES_SUB[0].fetch_add(ask_us, Ordering::Relaxed);
+            PREPARING[0].fetch_add(ask_us, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -6593,11 +6631,14 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
-    #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
+    let moved_us = moved.elapsed().as_micros() as u64;
+    if !title_dst {
+        COPIES_SUB[2].fetch_add(moved_us, Ordering::Relaxed);
+    }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    crate::copystat::add(crate::copystat::C::MoveUs, moved_us);
     if whole {
         return;
     }
@@ -6609,15 +6650,19 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
     if !title_dst && len >= 64 << 10 {
         read_sparse(src, dst, len);
     } else {
         read_pieces(src, dst, len);
     }
+    let sparse_us = sparse.elapsed().as_micros() as u64;
+    if !title_dst {
+        COPIES_SUB[3].fetch_add(sparse_us, Ordering::Relaxed);
+        COPIES_SUB[4].fetch_add(1, Ordering::Relaxed);
+    }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+    crate::copystat::add(crate::copystat::C::SparseUs, sparse_us);
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
@@ -7012,6 +7057,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         let cs_waits_now = crate::draw::COMPUTE_WAITS.swap(0, Ordering::Relaxed);
         let pso_making_now = crate::pipeline::making();
+        let csub = [0, 1, 2, 3, 4, 5].map(|i| COPIES_SUB[i].swap(0, Ordering::Relaxed));
         crate::perf_log::record_aggregate(&crate::perf_log::FrameAgg {
             frame,
             stats,
@@ -7020,6 +7066,12 @@ impl Meter {
             cpu_prep_ms: cpu,
             cpu_copies_ms: copy_ms,
             cpu_copies_mb: copy_mb,
+            copies_ask_ms: csub[0] as f64 / 1000.0 / frames,
+            copies_watch_ms: csub[1] as f64 / 1000.0 / frames,
+            copies_rpm_ms: csub[2] as f64 / 1000.0 / frames,
+            copies_sparse_ms: csub[3] as f64 / 1000.0 / frames,
+            copies_sparse_cnt: csub[4] as f64 / frames,
+            copies_whole_mb: csub[5] as f64 / 1e6 / frames,
             cpu_tex_ms: texture_ms,
             cpu_tex_mb: texture_mb,
             cpu_heap_ms: picked_ms,

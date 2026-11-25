@@ -1970,7 +1970,10 @@ fn record_print(record: &[u8]) -> u64 {
 
 fn own_copy_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_OWN_COPY").is_none_or(|v| v != "0"))
+    // Opt-in (`VICTORY_VIEW_OWN_COPY=1`): without RELAY_ALIAS_WAIT=1, separate
+    // exact copies for meshlet culling constants read stale pre-compute data
+    // and cause missing walls/floors and popping cubes.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_OWN_COPY").is_some_and(|v| v == "1"))
 }
 
 fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {

@@ -35,9 +35,6 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
-    /// Count of pages in `copied` still at `0` (never copied once); once 0,
-    /// unchanged refreshes skip locking `copied` and scanning clean pages.
-    uncopied: std::sync::atomic::AtomicUsize,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -1740,7 +1737,6 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
-            uncopied: std::sync::atomic::AtomicUsize::new(pages as usize),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2380,9 +2376,6 @@ impl Shadow {
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(at) = copied.get_mut(page - base) {
-                        if *at == 0 && now != 0 {
-                            self.uncopied.fetch_sub(1, Ordering::Relaxed);
-                        }
                         *at = now;
                     }
                 }
@@ -2441,7 +2434,10 @@ impl Shadow {
             }
             let hit = WRITTEN_BUF.with(|cell| {
                 let mut written = cell.borrow_mut();
-                if let Some(now) = crate::watch::writes_into(from, to, true, &mut written) {
+                let w_start = std::time::Instant::now();
+                let res = crate::watch::writes_into(from, to, true, &mut written);
+                crate::host::COPIES_SUB[1].fetch_add(w_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if let Some(now) = res {
                     self.watched.store(1, Ordering::Relaxed);
                     let copied = self.copy_stale(from, to, now, &written);
                     self.refresh_check(from, to);
@@ -2460,6 +2456,7 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        crate::host::COPIES_SUB[5].fetch_add((to - from) as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
@@ -2531,45 +2528,12 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
-        let all_copied = self.uncopied.load(Ordering::Relaxed) == 0;
-        if all_copied && written.is_empty() {
-            return 0;
-        }
         let base = self.start as usize / PAGE;
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        if all_copied {
-            // Every page has been copied at least once: only inspect pages in
-            // `written` instead of walking thousands of clean 64 KiB pages.
-            let mut bytes = 0;
-            let mut run: Option<(usize, usize)> = None;
-            for &(page, write) in written {
-                if page < base || page - base >= copied.len() {
-                    continue;
-                }
-                let at = &mut copied[page - base];
-                if write > *at {
-                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                        *at = now;
-                    }
-                    match run {
-                        Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
-                        Some((first, prev)) => {
-                            bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-                            run = Some((page, page));
-                        }
-                        None => run = Some((page, page)),
-                    }
-                }
-            }
-            if let Some((first, prev)) = run {
-                bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-            }
-            return bytes;
-        }
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -2583,9 +2547,6 @@ impl Shadow {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    if *at == 0 && now != 0 {
-                        self.uncopied.fetch_sub(1, Ordering::Relaxed);
-                    }
                     *at = now;
                 }
                 run.get_or_insert(page);
