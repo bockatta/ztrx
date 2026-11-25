@@ -1,13 +1,15 @@
 //! Lightweight top-right in-swapchain FPS & frametime overlay toggled by F9.
 //!
-//! Designed for near-zero overhead (< 0.05 ms/frame when visible, 0.000 ms and
+//! Designed for near-zero overhead (< 0.1 ms/frame when visible, 0.000 ms and
 //! zero D3D12 commands when hidden):
 //! - Fixed-size stack ring buffer (zero per-frame heap allocations).
-//! - Pre-allocated per-backbuffer upload strip (288x92, 256-byte row pitch).
+//! - Pre-allocated per-backbuffer upload strip (512x200, 2048-byte row pitch).
+//! - Large crisp integer-scaled glyphs (3x headline FPS + 2x metrics) for clear
+//!   readability at 1080p/1440p/4K.
 //! - Copied directly into the swapchain backbuffer via a single
 //!   `CopyTextureRegion` while the backbuffer is already in `COPY_DEST`
 //!   (no PSO, no HLSL, no RTV, no extra barriers, no DWM DirectFlip break).
-//! - Self-profiles CPU raster + command recording in nanoseconds (`last_us`).
+//! - Self-profiles CPU raster + command recording in microseconds (`last_us`).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -18,14 +20,16 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
-/// Panel pixel dimensions (288 wide x 92 tall, top-right with 8 px margin).
-pub(crate) const PANEL_W: u32 = 288;
-pub(crate) const PANEL_H: u32 = 92;
-/// 256-byte aligned row pitch for 4-byte-per-pixel formats (288 * 4 = 1152 -> 1280).
-const ROW_PITCH: usize = 1280;
+/// Panel pixel dimensions (512 wide x 200 tall, top-right with 16 px margin).
+pub(crate) const PANEL_W: u32 = 512;
+pub(crate) const PANEL_H: u32 = 200;
+/// 256-byte aligned row pitch for 4-byte-per-pixel formats (512 * 4 = 2048).
+const ROW_PITCH: usize = 2048;
+const STRIDE_U32: usize = ROW_PITCH / 4;
 const BUF_BYTES: usize = ROW_PITCH * PANEL_H as usize;
 const RING_LEN: usize = 240;
-const SPARK_BARS: usize = 138;
+/// 122 bars x 4 px = 488 px wide inside the 512 px panel.
+const SPARK_BARS: usize = 122;
 const VK_F9: i32 = 0x78;
 
 static VISIBLE: AtomicBool = AtomicBool::new(true);
@@ -43,6 +47,7 @@ pub(crate) struct FrameStats {
     pub avg_fps: f32,
     pub p99_ms: f32,
     pub p99_fps: f32,
+    #[allow(dead_code)]
     pub count: usize,
 }
 
@@ -128,6 +133,7 @@ impl FrameHistory {
         stats
     }
 
+    #[cfg(test)]
     pub(crate) fn stats(&self) -> FrameStats {
         self.last_stats
     }
@@ -217,7 +223,7 @@ impl OverlayGpu {
             LAST_OVERLAY_US.store(0, Ordering::Relaxed);
             return stats;
         }
-        if width < PANEL_W + 16 || height < PANEL_H + 16 {
+        if width < PANEL_W + 32 || height < PANEL_H + 32 {
             return stats;
         }
         let started = Instant::now();
@@ -259,8 +265,8 @@ impl OverlayGpu {
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
         };
-        let dst_x = width - PANEL_W - 8;
-        let dst_y = 8;
+        let dst_x = width - PANEL_W - 16;
+        let dst_y = 16;
         // SAFETY: `back` is in `COPY_DEST`, `dst_x + PANEL_W <= width`, `dst_y + PANEL_H <= height`.
         unsafe {
             list.CopyTextureRegion(&dst_loc, dst_x, dst_y, 0, &src_loc, None);
@@ -288,8 +294,8 @@ fn pack_pixel(format: DXGI_FORMAT, r: u8, g: u8, b: u8) -> u32 {
     }
 }
 
-/// Rasterizes the compact HUD panel (text + sparkline) into a `ROW_PITCH * PANEL_H`
-/// buffer with zero heap allocations.
+/// Rasterizes the readable HUD panel (3x headline FPS, 2x metrics + 76 px sparkline)
+/// directly onto u32 pixels with zero heap allocations.
 pub(crate) fn rasterize_panel(
     buf: &mut [u8],
     format: DXGI_FORMAT,
@@ -297,53 +303,41 @@ pub(crate) fn rasterize_panel(
     spark: &[f32],
     last_us: u64,
 ) {
-    let bg = pack_pixel(format, 14, 17, 24);
-    let border = pack_pixel(format, 68, 82, 108);
-    let graph_bg = pack_pixel(format, 9, 11, 16);
-    let text_hi = pack_pixel(format, 240, 246, 255);
-    let text_dim = pack_pixel(format, 155, 170, 195);
-    let green = pack_pixel(format, 72, 232, 128);
-    let yellow = pack_pixel(format, 248, 206, 68);
-    let red = pack_pixel(format, 246, 86, 86);
-    let ref_line = pack_pixel(format, 70, 82, 104);
-
-    // Fill background + 1 px border using fast slice fills (5x faster than per-pixel byte copies).
-    // SAFETY: `buf` is 4-byte aligned (D3D12 upload buffer or Vec<u8> >= 4-aligned in tests)
-    // and `ROW_PITCH` (1280) is a multiple of 4.
-    let stride_u32 = ROW_PITCH / 4;
-    let pixels: &mut [u32] = if (buf.as_ptr() as usize).is_multiple_of(4) {
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u32>(), buf.len() / 4) }
-    } else {
-        // Fallback for unaligned test slices.
-        for y in 0..PANEL_H {
-            let row_off = y as usize * ROW_PITCH;
-            for x in 0..PANEL_W {
-                let off = row_off + x as usize * 4;
-                buf[off..off + 4].copy_from_slice(&bg.to_le_bytes());
-            }
-        }
+    if !(buf.as_ptr() as usize).is_multiple_of(4) || buf.len() < BUF_BYTES {
         return;
+    }
+    // SAFETY: 4-byte aligned D3D12 upload buffer (or Vec<u8> in tests) of length >= BUF_BYTES.
+    let pixels = unsafe {
+        std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u32>(), BUF_BYTES / 4)
     };
+
+    let bg = pack_pixel(format, 12, 15, 22);
+    let border = pack_pixel(format, 90, 110, 145);
+    let graph_bg = pack_pixel(format, 7, 9, 14);
+    let text_hi = pack_pixel(format, 245, 250, 255);
+    let text_dim = pack_pixel(format, 175, 192, 215);
+    let green = pack_pixel(format, 78, 240, 134);
+    let yellow = pack_pixel(format, 252, 212, 72);
+    let red = pack_pixel(format, 250, 92, 92);
+    let ref_33 = pack_pixel(format, 42, 115, 72);
+    let ref_100 = pack_pixel(format, 128, 108, 42);
+
+    // Fill panel background with crisp 2 px border using fast slice fills.
     let w = PANEL_W as usize;
-    for y in 0..PANEL_H as usize {
-        let row = &mut pixels[y * stride_u32..y * stride_u32 + w];
-        if y == 0 || y == PANEL_H as usize - 1 {
+    let h = PANEL_H as usize;
+    for y in 0..h {
+        let row = &mut pixels[y * STRIDE_U32..y * STRIDE_U32 + w];
+        if y < 2 || y >= h - 2 {
             row.fill(border);
         } else {
             row.fill(bg);
             row[0] = border;
+            row[1] = border;
+            row[w - 2] = border;
             row[w - 1] = border;
         }
     }
 
-    let set_px = |buf: &mut [u8], x: u32, y: u32, px: u32| {
-        if x < PANEL_W && y < PANEL_H {
-            let off = y as usize * ROW_PITCH + x as usize * 4;
-            buf[off..off + 4].copy_from_slice(&px.to_le_bytes());
-        }
-    };
-
-    // Format fixed stack strings (no heap allocations).
     let fps_col = if stats.avg_fps >= 29.0 {
         green
     } else if stats.avg_fps >= 10.0 {
@@ -353,63 +347,65 @@ pub(crate) fn rasterize_panel(
     };
     let mut line = StackLine::new();
 
-    // Line 1 (y=6): FPS + AVG FPS
+    // Line 1 (y=12, 3x scale = 15x21 px glyphs): headline FPS + AVG
     line.clear();
     line.push_str("FPS ");
     line.push_f1(stats.cur_fps);
     line.push_str("  AVG ");
     line.push_f1(stats.avg_fps);
-    draw_text(buf, 8, 6, line.as_bytes(), fps_col, &set_px);
+    draw_text_scaled(pixels, 14, 12, line.as_bytes(), fps_col, 3);
 
-    // Line 2 (y=18): MS + AVG MS
+    // Line 2 (y=44, 2x scale = 10x14 px glyphs): frametime current & average
     line.clear();
-    line.push_str("MS ");
+    line.push_str("FT ");
     line.push_f1(stats.cur_ms);
-    line.push_str("  AVG ");
+    line.push_str("MS   AVG ");
     line.push_f1(stats.avg_ms);
-    draw_text(buf, 8, 18, line.as_bytes(), text_hi, &set_px);
+    line.push_str("MS");
+    draw_text_scaled(pixels, 14, 44, line.as_bytes(), text_hi, 2);
 
-    // Line 3 (y=30): 1% LOW ms & FPS
+    // Line 3 (y=66, 2x scale): 1% low ms & FPS
     line.clear();
-    line.push_str("1%L ");
+    line.push_str("1% LOW ");
     line.push_f1(stats.p99_ms);
     line.push_str("MS (");
     line.push_f1(stats.p99_fps);
     line.push_str(" FPS)");
-    draw_text(buf, 8, 30, line.as_bytes(), text_hi, &set_px);
+    draw_text_scaled(pixels, 14, 66, line.as_bytes(), text_hi, 2);
 
-    // Line 4 (y=42): Overlay cost + hotkey hint
+    // Line 4 (y=88, 2x scale): self-timed overlay cost + F9 hotkey
     line.clear();
     line.push_str("OVL ");
     line.push_f2(last_us as f32 / 1000.0);
-    line.push_str("MS  [F9 HIDE]");
-    draw_text(buf, 8, 42, line.as_bytes(), text_dim, &set_px);
+    line.push_str("MS   [F9 HIDE]");
+    draw_text_scaled(pixels, 14, 88, line.as_bytes(), text_dim, 2);
 
-    // Sparkline box: x=6..282 (276 px = 138 bars x 2 px), y=54..86 (32 px tall).
-    let (gx0, gy0, gw, gh) = (6u32, 54u32, (SPARK_BARS * 2) as u32, 32u32);
+    // Sparkline graph box: x=12..500 (488 px = 122 bars x 4 px), y=112..188 (76 px tall).
+    let (gx0, gy0, gw, gh) = (12usize, 112usize, SPARK_BARS * 4, 76usize);
     for y in gy0..gy0 + gh {
-        let row_off = y as usize * ROW_PITCH;
-        for x in gx0..gx0 + gw {
-            let off = row_off + x as usize * 4;
-            buf[off..off + 4].copy_from_slice(&graph_bg.to_le_bytes());
-        }
+        pixels[y * STRIDE_U32 + gx0..y * STRIDE_U32 + gx0 + gw].fill(graph_bg);
     }
-    // Dynamic vertical scale: at least 120 ms, clamped to 4x avg (so one huge hitch
-    // does not flatten normal bars), max 500 ms.
+
+    // Dynamic vertical scale: at least 120 ms, clamped to 2.5x avg (max 500 ms).
     let scale_ms = (stats.avg_ms * 2.5).clamp(120.0, 500.0);
-    // Reference lines at 33.3 ms (30 FPS) and 100 ms (10 FPS).
-    for target in [33.3f32, 100.0f32] {
-        let h = ((target / scale_ms) * (gh - 2) as f32).round() as u32;
-        if h < gh {
-            let ry = gy0 + gh - 1 - h;
-            for x in (gx0..gx0 + gw).step_by(2) {
-                set_px(buf, x, ry, ref_line);
+
+    // Dotted horizontal reference guides at 33.3 ms (30 FPS) and 100 ms (10 FPS).
+    for (target, col) in [(33.3f32, ref_33), (100.0f32, ref_100)] {
+        let th = ((target / scale_ms) * (gh - 4) as f32).round() as usize;
+        if th > 0 && th < gh {
+            let ry = gy0 + gh - 1 - th;
+            let row = &mut pixels[ry * STRIDE_U32..ry * STRIDE_U32 + w];
+            for x in (gx0..gx0 + gw).step_by(4) {
+                row[x] = col;
+                row[x + 1] = col;
             }
         }
     }
+
+    // Bars: 3 px solid + 1 px gap for clean visual separation.
     let offset = SPARK_BARS.saturating_sub(spark.len());
     for (i, &ms) in spark.iter().enumerate() {
-        let bar_h = (((ms / scale_ms) * (gh - 2) as f32).round() as u32).clamp(1, gh - 1);
+        let bar_h = (((ms / scale_ms) * (gh - 4) as f32).round() as usize).clamp(2, gh - 2);
         let col = if ms <= 34.0 {
             green
         } else if ms <= 100.0 {
@@ -417,10 +413,12 @@ pub(crate) fn rasterize_panel(
         } else {
             red
         };
-        let bx = gx0 + ((offset + i) * 2) as u32;
+        let bx = gx0 + (offset + i) * 4;
         for y in (gy0 + gh - bar_h)..(gy0 + gh) {
-            set_px(buf, bx, y, col);
-            set_px(buf, bx + 1, y, col);
+            let base = y * STRIDE_U32 + bx;
+            pixels[base] = col;
+            pixels[base + 1] = col;
+            pixels[base + 2] = col;
         }
     }
 }
@@ -484,24 +482,37 @@ impl StackLine {
     }
 }
 
-fn draw_text(
-    buf: &mut [u8],
-    mut x: u32,
-    y: u32,
-    text: &[u8],
-    px: u32,
-    set_px: &impl Fn(&mut [u8], u32, u32, u32),
-) {
+/// Draws integer-scaled 5x7 glyphs directly onto the u32 pixel buffer.
+fn draw_text_scaled(pixels: &mut [u32], mut x: usize, y: usize, text: &[u8], px: u32, scale: usize) {
+    let w = PANEL_W as usize;
+    let h = PANEL_H as usize;
+    let advance = 6 * scale;
     for &ch in text {
+        if x + 5 * scale > w {
+            break;
+        }
         let g = glyph(ch);
         for (row, &bits) in g.iter().enumerate() {
-            for col in 0..5u32 {
+            if bits == 0 {
+                continue;
+            }
+            let py0 = y + row * scale;
+            if py0 + scale > h {
+                break;
+            }
+            for col in 0..5usize {
                 if (bits >> (4 - col)) & 1 != 0 {
-                    set_px(buf, x + col, y + row as u32, px);
+                    let px0 = x + col * scale;
+                    for dy in 0..scale {
+                        let base = (py0 + dy) * STRIDE_U32 + px0;
+                        for dx in 0..scale {
+                            pixels[base + dx] = px;
+                        }
+                    }
                 }
             }
         }
-        x += 6;
+        x += advance;
     }
 }
 
@@ -519,6 +530,7 @@ fn glyph(ch: u8) -> [u8; 7] {
         b'8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
         b'9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
         b'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
+        b'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
         b'D' => [0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100],
         b'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
         b'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
@@ -527,10 +539,15 @@ fn glyph(ch: u8) -> [u8; 7] {
         b'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
         b'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
         b'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
+        b'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
         b'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
         b'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
+        b'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
         b'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        b'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        b'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
         b'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
+        b'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
         b'.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
         b'%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         b'(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
@@ -538,6 +555,8 @@ fn glyph(ch: u8) -> [u8; 7] {
         b'[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
         b']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
         b':' => [0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000],
+        b'-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
+        b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         _ => [0; 7],
     }
 }
@@ -577,7 +596,7 @@ mod tests {
         }
         let avg_us = started.elapsed().as_micros() as f64 / 100.0;
         println!("overlay rasterize avg: {avg_us:.2} us/frame");
-        let budget_us = if cfg!(debug_assertions) { 1500.0 } else { 500.0 };
+        let budget_us = if cfg!(debug_assertions) { 3000.0 } else { 500.0 };
         assert!(
             avg_us < budget_us,
             "overlay rasterization exceeded {budget_us} us budget: {avg_us:.1} us"

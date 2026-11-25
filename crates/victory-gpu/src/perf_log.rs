@@ -104,6 +104,7 @@ fn log_path() -> PathBuf {
 }
 
 fn ensure_open() {
+    let mut opened_now = false;
     SINK_OPENED.call_once(|| {
         let _ = start_time();
         let path = log_path();
@@ -115,16 +116,20 @@ fn ensure_open() {
                 let mut guard = SINK.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(Sink {
                     writer: BufWriter::with_capacity(16 * 1024, file),
-                    last_agg: Instant::now(),
+                    last_agg: Instant::now() - Duration::from_secs(10),
                 });
-                drop(guard);
-                milestone("engine_init", "structured perf log opened");
+                opened_now = true;
             }
             Err(e) => {
                 tracing::warn!(error = %e, path = %path.display(), "could not open perf JSONL log");
             }
         }
     });
+    if opened_now {
+        // Emit initial milestone AFTER `SINK_OPENED.call_once` completes to avoid
+        // re-entering `Once::call_once` on the same thread (which deadlocks).
+        milestone("engine_init", "structured perf log opened");
+    }
 }
 
 fn write_line(line: &str) {
@@ -304,5 +309,16 @@ mod tests {
         }
         let avg_us = started.elapsed().as_micros() as f64 / 100.0;
         assert!(avg_us < 100.0, "perf log formatting too slow: {avg_us:.1} us");
+    }
+
+    #[test]
+    fn perf_log_ensure_open_and_milestone_do_not_deadlock() {
+        // Regression test: `ensure_open` must never re-enter `SINK_OPENED.call_once`.
+        let started = Instant::now();
+        milestone("test_open", "verifying non-reentrant Once initialization");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "perf_log::milestone blocked unexpectedly"
+        );
     }
 }
