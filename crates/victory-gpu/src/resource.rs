@@ -246,20 +246,27 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
+/// The shared-exponent HDR format R9G9B9E5 (67) is the same: the console
+/// renders to it and writes it as unordered access (in the Series S
+/// profile the title asks for a 1920x1080 target of it), the host only
+/// samples it, and the refused texture left the passes writing it invalid
+/// until the device was removed. R11G11B10_FLOAT stands in: the same three
+/// unsigned float channels in 32 bits, with 6/6/5-bit mantissas instead of
+/// 9.
 /// shortcut: copies between such a target and a texture the title fills
-/// itself in the 16-bit format are skipped ([`stands_in`]); convert them
+/// itself in the original format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 26)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; STAND_INS.len()]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, stand_in)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +286,11 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(
+                        format = f,
+                        stand_in,
+                        "the host does not render to this format: another stands in"
+                    );
                 }
                 refused
             })
@@ -1390,8 +1401,22 @@ pub(crate) fn room() -> bool {
     if filled < FLOOR {
         return true;
     }
+    // Past the card's own memory, into the PC's memory the system shares
+    // with it (`VICTORY_TEXTURE_SPILL=0`: the card's alone, as before): up
+    // to half the shared budget, the rest left to the title. On a 6 GB card
+    // the card's nine tenths were reached in the world's first frames, and
+    // the textures still waiting (skin, walls, clothes: 9,000-27,000 slots)
+    // were sampled empty, black in the G-buffer's albedo; with the shared
+    // memory taken too the same shots had their faces and walls. A texture
+    // there is read over the bus: slower, not missing.
+    static SPILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let spill = *SPILL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SPILL").is_none_or(|v| v != "0"));
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        Some([budget, used, ..]) if !spill => used < budget / 100 * room_percent(),
+        Some([budget, used, shared_budget, shared_used]) => {
+            let own = budget / 100 * room_percent();
+            used < own || used + shared_used < own + shared_budget / 2
+        }
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1739,6 +1764,12 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     }
     let r = resource(this);
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
+}
+
+/// A texture's width, height and format as the title described it; `None`
+/// for buffers. Makes no host copy.
+pub(crate) fn texture_size(this: This) -> Option<(u64, u32, u32)> {
+    texture_memory(this).map(|(_, d)| (d.width, d.height, d.format))
 }
 
 /// A buffer's host memory and size; `None` for textures.
