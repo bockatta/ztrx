@@ -24,6 +24,11 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
+/// 128-bit source fingerprint of `victory-shader` (`src/**` + `Cargo.toml`),
+/// computed at build time so the on-disk shader cache invalidates when and
+/// only when the translator changes.
+pub const SOURCE_FINGERPRINT: &str = env!("VICTORY_SHADER_FINGERPRINT");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

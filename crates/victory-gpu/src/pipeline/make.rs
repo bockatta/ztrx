@@ -59,6 +59,10 @@ impl Pending {
         }
     }
 
+    fn is_compute(&self) -> bool {
+        self.graphics.is_none() && self.shaders.iter().any(|s| s.stage == "compute")
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
@@ -217,16 +221,23 @@ const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
+/// Multi-lane priority queue: fast graphics & mesh pipelines (10-50 ms each)
+/// are scheduled separately from heavy compute pipelines (up to 10+ s each on
+/// NVIDIA), so world geometry is never starved behind a wall of compute PSOs.
 struct Queue {
-    early: VecDeque<Arc<Pending>>,
-    requested: VecDeque<Arc<Pending>>,
+    requested_gfx: VecDeque<Arc<Pending>>,
+    requested_cs: VecDeque<Arc<Pending>>,
+    early_gfx: VecDeque<Arc<Pending>>,
+    early_cs: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
     const fn new() -> Self {
         Self {
-            early: VecDeque::new(),
-            requested: VecDeque::new(),
+            requested_gfx: VecDeque::new(),
+            requested_cs: VecDeque::new(),
+            early_gfx: VecDeque::new(),
+            early_cs: VecDeque::new(),
         }
     }
 
@@ -238,20 +249,40 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        let compute = p.is_compute();
+        match (priority == REQUESTED, compute) {
+            (true, false) => self.requested_gfx.push_back(p.clone()),
+            (true, true) => self.requested_cs.push_back(p.clone()),
+            (false, false) => self.early_gfx.push_back(p.clone()),
+            (false, true) => self.early_cs.push_back(p.clone()),
         }
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
-            // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+    fn pop_early(lane: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+        // An early entry can have been promoted and claimed already.
+        std::iter::from_fn(|| lane.pop_front())
+            .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+    }
+
+    /// Pops the highest-priority pending pipeline. Fast-lane workers drain all
+    /// graphics/mesh work (`requested_gfx` then `early_gfx`) before touching
+    /// heavy compute pipelines; general workers prioritise `requested_gfx`,
+    /// then `requested_cs`, then `early_gfx`, then `early_cs`.
+    fn pop(&mut self, fast_lane: bool) -> Option<Arc<Pending>> {
+        let p = if fast_lane {
+            self.requested_gfx
+                .pop_front()
+                .or_else(|| Self::pop_early(&mut self.early_gfx))
+                .or_else(|| self.requested_cs.pop_front())
+                .or_else(|| Self::pop_early(&mut self.early_cs))
+        } else {
+            self.requested_gfx
+                .pop_front()
+                .or_else(|| self.requested_cs.pop_front())
+                .or_else(|| Self::pop_early(&mut self.early_gfx))
+                .or_else(|| Self::pop_early(&mut self.early_cs))
+        }?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -281,10 +312,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next(fast_lane: bool) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(fast_lane) {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -335,16 +366,27 @@ fn commit_room() {
 /// Times a pipeline worker waited for commit ([`commit_room`]).
 pub(crate) static COMMIT_WAITS: AtomicU64 = AtomicU64::new(0);
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// Starts the workers (all logical processors minus 2, clamped to 2..=10,
+/// or `VICTORY_PIPELINE_WORKERS`) on first use. Half are fast-lane workers
+/// that drain graphics/mesh pipelines ahead of heavy compute pipelines.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let default_workers = std::thread::available_parallelism()
+            .map_or(2, |n| n.get().saturating_sub(2).clamp(2, 10));
+        let workers = std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or(default_workers);
+        let fast_count = (workers / 2).max(1);
+        tracing::info!(workers, fast_lane = fast_count, "starting host pipeline compiler workers");
         for i in 0..workers {
+            let fast_lane = i < fast_count;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -352,7 +394,7 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        let p = next();
+                        let p = next(fast_lane);
                         commit_room();
                         p.make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -435,10 +477,32 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
+        assert!(queue.pop(false).is_none());
+    }
+
+    #[test]
+    fn fast_lane_drains_graphics_ahead_of_compute_backlog() {
+        let cs_shader = super::super::shader("compute", b"cs-heavy");
+        let vs_shader = super::super::shader("vertex", b"vs-fast");
+        let cs = Arc::new(Pending::new(vec![cs_shader], None));
+        let gfx_early = Arc::new(Pending::new(vec![vs_shader.clone()], None));
+        let gfx_req = Arc::new(Pending::new(vec![vs_shader], None));
+        let mut queue = Queue::new();
+
+        assert_eq!(queue.push(&cs, REQUESTED), Some(true));
+        assert_eq!(queue.push(&gfx_early, EARLY), Some(true));
+        assert_eq!(queue.push(&gfx_req, REQUESTED), Some(true));
+
+        // Both fast-lane and general workers take requested graphics first.
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &gfx_req));
+        // Fast-lane worker takes early graphics ahead of requested compute!
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &gfx_early));
+        // General worker takes requested compute.
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &cs));
+        assert!(queue.pop(true).is_none());
     }
 }
