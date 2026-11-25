@@ -468,17 +468,6 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    if crate::host::fill_on_card()
-        && crate::host::late()
-        && (shadow.carded()
-            || crate::host::flights_write(address as usize, address as usize + len as usize))
-        && let Some(gpu) = {
-            shadow.refresh(list, address, len);
-            list.card_constants(&shadow, address, len)
-        }
-    {
-        return Some(gpu);
-    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -2657,9 +2646,8 @@ impl State {
                     Some(View::Constant(address, size))
                         if crate::host::fill_on_card()
                             && crate::host::late()
+                            && crate::host::flights_write(address as usize, address as usize + size as usize)
                             && let Some(shadow) = crate::shadow::find(address, u64::from(size))
-                            && (shadow.carded()
-                                || crate::host::flights_write(address as usize, address as usize + size as usize))
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));
                                 list.card_constants(&shadow, address, u64::from(size))

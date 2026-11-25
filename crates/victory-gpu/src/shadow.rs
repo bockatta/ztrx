@@ -2551,7 +2551,7 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if from < to && copy_compare() && !self.upload.load(Ordering::Relaxed) {
+        if from < to && copy_compare() && !self.carded() && !self.upload.load(Ordering::Relaxed) {
             return self.copy_compared(from, to);
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
