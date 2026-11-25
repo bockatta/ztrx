@@ -5925,8 +5925,6 @@ impl Meter {
         let sh_pct = if total_sh > 0 { (ready * 100) / total_sh } else { 100 };
         let tex_up = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed);
         let tex_wait = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
-        let tex_tot = tex_up + tex_wait;
-        let tex_pct = if tex_tot > 0 { (tex_up * 100) / tex_tot } else { 100 };
         let vram = host()
             .and_then(|h| h.video_memory())
             .map(|[budget, used, ..]| {
@@ -5939,7 +5937,7 @@ impl Meter {
             .unwrap_or_else(|| "VRAM n/a".into());
         let phase = if draws < 50.0 { "Loading" } else { "In-World" };
         let text = format!(
-            "ALquerez ({phase}) | {fps:.1} fps ({ms:.0}ms) | Shaders {sh_pct}% ({ready}/{total_sh}) | Load {tex_pct}% | {vram} | {draws:.0} draws (drop {dropped:.0}) | Heap {picked_ms:.0}ms | [A]=Enter/Space [Look]=Mouse(F8)"
+            "ALquerez ({phase}) | {fps:.1} fps ({ms:.0}ms) | Shaders {sh_pct}% ({ready}/{total_sh}) | Tex {tex_up} up ({tex_wait} q) | {vram} | {draws:.0} draws (drop {dropped:.0}) | Heap {picked_ms:.0}ms"
         );
         let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
