@@ -1810,10 +1810,12 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        let mut processed = 0usize;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
             }
+            processed += 1;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -1956,9 +1958,11 @@ impl State {
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
-            // A texture view the host refuses removes the device: name it.
+            // A texture view the host refuses removes the device: check every 64 slots
+            // instead of issuing a D3D12 GetDeviceRemovedReason call on every single texture.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !GONE.load(Ordering::Relaxed)
+            if processed.is_multiple_of(64)
+                && !GONE.load(Ordering::Relaxed)
                 && let Some(why) = crate::descriptor::host::device_removed()
             {
                 GONE.store(true, Ordering::Relaxed);

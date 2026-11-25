@@ -594,9 +594,38 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk_rows(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
+    }
+
+    /// Detiles rows `y_start..y_end` of a single 2D/array mip subresource into `linear`,
+    /// where `linear` starts at row `y_start` (length `>= (y_end - y_start) * row_pitch`).
+    /// Disjoint row ranges write strictly disjoint output slices for parallel detiling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+        y_start: u32,
+        y_end: u32,
+    ) -> Result<(), Error> {
+        self.walk_rows(
+            tiled.len(),
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            Some((y_start, y_end)),
+            |t, l, len| {
+                linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+            },
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,14 +638,14 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk_rows(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
     #[allow(clippy::too_many_arguments)]
-    fn walk(
+    fn walk_rows(
         &self,
         tiled_len: usize,
         mip: u32,
@@ -624,6 +653,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        rows: Option<(u32, u32)>,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
@@ -644,9 +674,17 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
+        let (y_lo, y_hi) = match rows {
+            Some((a, b)) => (a.min(m.height), b.min(m.height)),
+            None => (0, m.height),
+        };
+        if y_lo >= y_hi {
+            return Ok(());
+        }
+        let row_count = (y_hi - y_lo) as usize;
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
+            .zip((row_count - 1).checked_mul(row_pitch))
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
@@ -681,8 +719,8 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in y_lo..y_hi {
+                let linear_row = z as usize * depth_pitch + (y - y_lo) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy(tiled_row as usize, linear_row, bytes);
