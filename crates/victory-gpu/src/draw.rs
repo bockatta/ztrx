@@ -2139,7 +2139,7 @@ impl State {
         if use_async
             && async_queued > 0
             && census[1] >= 1024
-            && *LOAD_DRAIN.get_or_init(|| std::env::var_os("VICTORY_LOAD_DRAIN").is_none_or(|v| v != "0"))
+            && *LOAD_DRAIN.get_or_init(|| std::env::var_os("VICTORY_LOAD_DRAIN").is_some_and(|v| v == "1"))
             && DRAIN_PASSES.fetch_add(1, Ordering::Relaxed) < 24
         {
             crate::texture::async_drain_wait(150);

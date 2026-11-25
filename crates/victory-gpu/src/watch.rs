@@ -311,17 +311,24 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // PR #670: skip guaranteed-to-fail `GetWriteWatch` on memory the guards
+    // already hold as view memory.
+    let known_view = {
+        let g = guards();
+        g.protected.contains(&first) || g.absent.contains(&first)
+    };
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = known_view
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
     if failed {
         return false;
     }
@@ -352,6 +359,22 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+}
+
+/// Zero-allocation variant of [`writes`]: fills caller-provided `out` instead
+/// of heap-allocating a new `Vec` on every one of the ~4,600 buffer checks/f.
+pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, out: &mut Vec<(usize, u64)>) -> Option<u64> {
+    out.clear();
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        out.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+        return Some(j.ahead_asked);
+    }
+    drop(j);
+    let (now, vec) = writes(start, end, guarded)?;
+    *out = vec;
+    Some(now)
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -436,17 +459,24 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // PR #670: skip guaranteed-to-fail `GetWriteWatch` on memory the guards
+    // already hold as view memory.
+    let known_view = guarded && {
+        let g = guards();
+        g.protected.contains(&first) || g.absent.contains(&first)
+    };
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = known_view
+        || unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
     let guarded = if failed {
         count = 0;
         if !guarded {

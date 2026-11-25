@@ -2437,15 +2437,15 @@ static GPU_WRITTEN_CBV_PAGES: std::sync::RwLock<Option<std::collections::HashSet
 static GPU_WRITTEN_CBV_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn note_gpu_written_cbv_page(src: usize, len: usize) {
-    if len == 0 {
+    if len == 0 || len > 512 {
         return;
     }
-    // Learn at 1 MiB chunk granularity (`>> 20`) up to 1024 chunks (1 GiB):
-    // GTA VI's 480-byte constant ring buffer spans 32+ MiB (`0x77c..0x8b5`),
-    // which previously overflowed the 128 x 64 KiB (8 MiB) cap and kept
-    // settling 0.5-0.8x/frame (~40 ms/frame).
-    let first = src >> 20;
-    let last = src.saturating_add(len).saturating_sub(1) >> 20;
+    // Learn 64 KiB pages (`>> 16`) strictly for small (<= 512 B, e.g. 480 B)
+    // GPU-written CBVs up to 1024 pages (64 MiB): covers GTA VI's 32+ MiB
+    // constant ring buffer (`0x77c..0x8b5`) without ever matching unrelated
+    // large CBVs (which caused UAV barrier storms at 1 MiB granularity).
+    let first = src >> 16;
+    let last = src.saturating_add(len).saturating_sub(1) >> 16;
     let mut set = GPU_WRITTEN_CBV_PAGES.write().unwrap_or_else(|e| e.into_inner());
     let set = set.get_or_insert_with(std::collections::HashSet::new);
     if set.len() >= 1024 {
@@ -2461,11 +2461,11 @@ pub(crate) fn note_gpu_written_cbv_page(src: usize, len: usize) {
 }
 
 pub(crate) fn is_gpu_written_cbv_page(address: u64, len: u64) -> bool {
-    if len == 0 || GPU_WRITTEN_CBV_COUNT.load(Ordering::Relaxed) == 0 {
+    if len == 0 || len > 512 || GPU_WRITTEN_CBV_COUNT.load(Ordering::Relaxed) == 0 {
         return false;
     }
-    let first = (address as usize) >> 20;
-    let last = (address.saturating_add(len).saturating_sub(1) as usize) >> 20;
+    let first = (address as usize) >> 16;
+    let last = (address.saturating_add(len).saturating_sub(1) as usize) >> 16;
     let set = GPU_WRITTEN_CBV_PAGES.read().unwrap_or_else(|e| e.into_inner());
     let Some(set) = set.as_ref() else {
         return false;
@@ -6362,13 +6362,12 @@ impl HostList {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
-/// Whether `Batch::flush` resolves dirty page ranges on the submitting thread
-/// (zero `watch::JOURNAL` lock contention) and executes the raw byte copies in
-/// coarse parallel chunks across `shadow::wide_run` (`VICTORY_PARALLEL_COPY=0`
-/// reverts to single-threaded copies).
+/// Opt-in parallel `Batch::flush` (`VICTORY_PARALLEL_COPY=1`; off by default
+/// because concurrent `ReadProcessMemory` contends on Windows' kernel
+/// WorkingSetMutex).
 fn parallel_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_COPY").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_COPY").is_some_and(|v| v == "1"))
 }
 
 fn wide_refresh() -> bool {
