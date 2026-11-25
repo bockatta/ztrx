@@ -206,14 +206,13 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // Only while the card has room: allow up to 95% of VRAM budget (was 80%,
+    // which refused world buffers once packed wall textures + early uploads
+    // filled VRAM past 76%, forcing 700+ MB/frame onto CPU snapshotting).
+    // `CARD_BUFFERS_MB` (1024 MiB) still caps total card copies, and textures
+    // spill into shared system RAM (`VICTORY_TEXTURE_SPILL=1`).
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * 95
     {
         return None;
     }
