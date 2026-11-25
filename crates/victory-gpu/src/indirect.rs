@@ -671,25 +671,32 @@ void main() {
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        const RING_HEADER: usize = 64 << 10;
+        const RING_STRIDE: usize = (64 << 10) + 64;
+        const RING_SLOTS: u32 = 4;
+        let (_ring, ring_ptr, ring_gpu) =
+            warp.shared_buffer(RING_HEADER as u64 + u64::from(RING_SLOTS) * RING_STRIDE as u64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
         // One pass over the three pieces; what it left in `differs` (7s
         // where it stored nothing).
-        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+        let run = |warp: &mut WarpHarness, mode: u32, max_slots: u32| -> [u32; 3] {
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
+                ring_ptr.cast::<u32>().write_volatile(0);
                 for piece in 0..PIECES as usize {
                     differs_ptr.cast::<u32>().add(piece).write_volatile(7);
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, max_slots];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, ring_gpu);
                 warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
@@ -700,24 +707,28 @@ void main() {
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
-        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 0, 0), [7, 7, 7]);
+        assert_eq!(run(&mut warp, 1, 0), [0, 0, 0]);
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1, 0), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1, 0), [0, 1, 0]);
         // Changed back: with 1 the piece looks untouched.
         set(content[at]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 1, 0), [0, 0, 0]);
         // With 2 the change is flagged once, and the hash is the new one.
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
-        // Changed back: flagged, where 1 saw nothing.
+        assert_eq!(run(&mut warp, 2, 0), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2, 0), [0, 0, 0]);
+        // Changed back with inline scatter-fetch enabled (`max_slots = 4`):
+        // slot 0 is claimed (`differs[1] == 2`) and all 64 KiB match bit-for-bit.
         set(content[at]);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 2, RING_SLOTS), [0, 2, 0]);
+        assert_eq!(unsafe { ring_ptr.cast::<u32>().read_volatile() }, 1);
+        let copied = unsafe { std::slice::from_raw_parts(ring_ptr.add(RING_HEADER), PIECE) };
+        assert_eq!(copied, &content[PIECE..2 * PIECE]);
+        assert_eq!(run(&mut warp, 2, RING_SLOTS), [0, 0, 0]);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
