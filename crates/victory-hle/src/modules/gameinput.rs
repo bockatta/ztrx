@@ -63,7 +63,7 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, Mouse (F8) or I/J/K/L right; triggers RMB/Z and LMB/C.
-const FALLBACK_BUTTONS: [(u8, u32); 19] = [
+const FALLBACK_BUTTONS: [(u8, u32); 25] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (b'M', VIEW), // M (Map / View)
@@ -79,7 +79,13 @@ const FALLBACK_BUTTONS: [(u8, u32); 19] = [
     (0x25, LEFT),
     (0x27, RIGHT),
     (b'Q', LEFT_SHOULDER),
+    (0xDB, LEFT_SHOULDER), // [
+    (0x21, LEFT_SHOULDER), // Page Up
+    (b'1', LEFT_SHOULDER), // 1
     (b'E', RIGHT_SHOULDER),
+    (0xDD, RIGHT_SHOULDER), // ]
+    (0x22, RIGHT_SHOULDER), // Page Down
+    (b'3', RIGHT_SHOULDER), // 3
     (b'F', LEFT_STICK),
     (0xA2, LEFT_STICK), // Left Ctrl (Crouch)
     (b'H', RIGHT_STICK),
