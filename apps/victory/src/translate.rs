@@ -414,7 +414,9 @@ fn translate(
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     // `VICTORY_WAVE_WIDE_ONLY`: the wave-wide form for the containers it names.
-    emit::with_wave_wide(emit::wave_wide_only(&hash), || translate_programs(&container, programs, &example, t, checks));
+    emit::with_wave_wide(emit::wave_wide_only(&hash), || {
+        translate_programs(&container, &hash, programs, &example, t, checks)
+    });
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -427,7 +429,7 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(container: &Container, hash: &str, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -491,7 +493,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    // (by its hash, as at run time: the per-program switches, `VICTORY_WAVE_WHY`)
+                    match emit::for_program(hash, || emit::emit(container, &p, &program, &s, &i, &r)) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
