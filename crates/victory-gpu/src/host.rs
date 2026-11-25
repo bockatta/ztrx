@@ -5,14 +5,15 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -6384,18 +6385,104 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
+static HUD_HWND: AtomicUsize = AtomicUsize::new(0);
+static HUD_VISIBLE: AtomicBool = AtomicBool::new(true);
+
+fn position_hud(owner: HWND) {
+    let raw = HUD_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let hud = HWND(raw as *mut _);
+    // SAFETY: queries owner client area and positions our owned translucent HUD bar.
+    unsafe {
+        if !HUD_VISIBLE.load(Ordering::Relaxed) || IsIconic(owner).as_bool() {
+            let _ = ShowWindow(hud, SW_HIDE);
+            return;
+        }
+        let mut rc = RECT::default();
+        if GetClientRect(owner, &mut rc).is_ok() {
+            let mut pt = POINT { x: rc.left, y: rc.bottom };
+            let _ = ClientToScreen(owner, &mut pt);
+            let width = (rc.right - rc.left).max(320);
+            let bar_h = 30;
+            let _ = SetWindowPos(
+                hud,
+                None,
+                pt.x,
+                pt.y - bar_h,
+                width,
+                bar_h,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+            );
+            let _ = InvalidateRect(Some(hud), None, true);
+        }
+    }
+}
+
+extern "system" fn hud_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_PAINT {
+        // SAFETY: standard BeginPaint/EndPaint drawing into our HUD bar.
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !hdc.is_invalid() {
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let bg = CreateSolidBrush(COLORREF(0x0018_1410));
+                let _ = FillRect(hdc, &rc, bg);
+                let _ = DeleteObject(bg.into());
+                let _ = SetBkMode(hdc, TRANSPARENT);
+                let _ = SetTextColor(hdc, COLORREF(0x00F4_F4F4));
+                let font = GetStockObject(DEFAULT_GUI_FONT);
+                let old = SelectObject(hdc, font);
+                let mut text: Vec<u16> = "PC CONTROLS (F1 hide):  [A] Continue/Sprint = Enter / Space / Shift  |  [B] Back/Reload = Backspace / R  |  [X]=X  [Y]=Y  |  [LT] Aim=RMB/Z  [RT] Shoot=LMB/C  |  [LB/RB]=Q/E  |  [Move]=WASD  |  [Look]=Mouse(F8)/IJKL  |  [Menu]=Esc  [View]=Tab/M"
+                    .encode_utf16()
+                    .collect();
+                let _ = DrawTextW(
+                    hdc,
+                    &mut text,
+                    &mut rc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                let _ = SelectObject(hdc, old);
+                let _ = EndPaint(hwnd, &ps);
+            }
+        }
+        return LRESULT(0);
+    }
+    // SAFETY: default handling for other messages.
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    match message {
+        WM_MOVE | WM_SIZE => position_hud(hwnd),
+        WM_KEYDOWN if wparam.0 == 0x70 => {
+            // F1 toggles the PC keybind legend overlay.
+            let next = !HUD_VISIBLE.load(Ordering::Relaxed);
+            HUD_VISIBLE.store(next, Ordering::Relaxed);
+            position_hud(hwnd);
+        }
+        _ => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
     const CLASS: PCWSTR = w!("VIctory");
+    const HUD_CLASS: PCWSTR = w!("VIctoryKeyHud");
     // SAFETY: registers our class once and creates a window of it.
     unsafe {
         let instance = GetModuleHandleW(None)?;
@@ -6415,10 +6502,10 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        CreateWindowExW(
+        let main_hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("VIctory"),
+            w!("VIctory — [A]=Enter/Space  [B]=Back/R  [Move]=WASD  [Look]=Mouse(F8)/IJKL  [F1]=HUD"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -6428,7 +6515,34 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )
+        )?;
+        let hud_class = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(hud_proc),
+            hInstance: instance.into(),
+            lpszClassName: HUD_CLASS,
+            ..Default::default()
+        };
+        RegisterClassExW(&hud_class);
+        if let Ok(hud) = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            HUD_CLASS,
+            w!(""),
+            WS_POPUP | WS_VISIBLE,
+            0,
+            0,
+            640,
+            30,
+            Some(main_hwnd),
+            None,
+            Some(instance.into()),
+            None,
+        ) {
+            let _ = SetLayeredWindowAttributes(hud, COLORREF(0), 210, LWA_ALPHA);
+            HUD_HWND.store(hud.0 as usize, Ordering::Relaxed);
+            position_hud(main_hwnd);
+        }
+        Ok(main_hwnd)
     }
 }
 

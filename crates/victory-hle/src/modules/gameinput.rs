@@ -62,12 +62,16 @@ const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+/// Sticks: W/A/S/D left, Mouse (F8) or I/J/K/L right; triggers RMB/Z and LMB/C.
+const FALLBACK_BUTTONS: [(u8, u32); 19] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
+    (b'M', VIEW), // M (Map / View)
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
+    (0xA0, A),    // Left Shift (Sprint)
     (0x08, B),    // Backspace
+    (b'R', B),    // R (Reload / Back)
     (b'X', X),
     (b'Y', Y),
     (0x26, UP), // arrows
@@ -77,6 +81,7 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
     (b'F', LEFT_STICK),
+    (0xA2, LEFT_STICK), // Left Ctrl (Crouch)
     (b'H', RIGHT_STICK),
 ];
 
@@ -111,11 +116,15 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Optional mouse-to-gamepad look/triggers: (right_x, right_y, left_trigger, right_trigger).
+    fn mouse(&mut self) -> (f32, f32, bool, bool) {
+        (0.0, 0.0, false, false)
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
-fn fallback(keys: &[KeyState]) -> PadState {
+fn fallback(keys: &[KeyState], mouse: (f32, f32, bool, bool)) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
             1.0
@@ -123,17 +132,20 @@ fn fallback(keys: &[KeyState]) -> PadState {
             0.0
         }
     };
+    let (mx, my, ml, mr) = mouse;
+    let rx = (on(b'L') - on(b'J') + mx).clamp(-1.0, 1.0);
+    let ry = (on(b'I') - on(b'K') + my).clamp(-1.0, 1.0);
     PadState {
         buttons: FALLBACK_BUTTONS
             .iter()
             .filter(|(vk, _)| on(*vk) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
+        left_trigger: if ml { 1.0 } else { on(b'Z') },
+        right_trigger: if mr { 1.0 } else { on(b'C') },
         left_x: on(b'D') - on(b'A'),
         left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        right_x: rx,
+        right_y: ry,
     }
 }
 
@@ -401,12 +413,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let mouse = source.mouse();
+            (pads, keys, mouse)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -451,6 +465,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: (f32, f32, bool, bool),
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -458,7 +473,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1072,6 +1087,7 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1085,7 +1101,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1130,10 +1146,20 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse_look: bool,
+        f8_was_down: bool,
+    }
+
+    fn force_kbm() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_KBM").is_ok_and(|v| v == "1"))
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if force_kbm() {
+                return None;
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1186,6 +1212,46 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse(&mut self) -> (f32, f32, bool, bool) {
+            if !focused() {
+                self.f8_was_down = false;
+                return (0.0, 0.0, false, false);
+            }
+            // F8 toggles mouse-look capture (re-centering cursor inside the game window).
+            // SAFETY: plain key-state query.
+            let f8_down = unsafe { GetAsyncKeyState(0x77) } < 0;
+            if f8_down && !self.f8_was_down {
+                self.mouse_look = !self.mouse_look;
+                tracing::info!(mouse_look = self.mouse_look, "PC mouse look toggled (F8)");
+            }
+            self.f8_was_down = f8_down;
+            // SAFETY: plain mouse-button queries (VK_LBUTTON=0x01, VK_RBUTTON=0x02).
+            let rt = unsafe { GetAsyncKeyState(0x01) } < 0;
+            let lt = unsafe { GetAsyncKeyState(0x02) } < 0;
+            let mut rx = 0.0_f32;
+            let mut ry = 0.0_f32;
+            if self.mouse_look {
+                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                let mut pt = POINT { x: 0, y: 0 };
+                // SAFETY: valid pointers; hwnd is the foreground window of our process.
+                unsafe {
+                    let hwnd = GetForegroundWindow();
+                    if GetWindowRect(hwnd, &mut rect) != 0 && GetCursorPos(&mut pt) != 0 {
+                        let cx = (rect.left + rect.right) / 2;
+                        let cy = (rect.top + rect.bottom) / 2;
+                        let dx = (pt.x - cx) as f32;
+                        let dy = (cy - pt.y) as f32; // up is positive on right stick
+                        if dx != 0.0 || dy != 0.0 {
+                            rx = (dx / 24.0).clamp(-1.0, 1.0);
+                            ry = (dy / 24.0).clamp(-1.0, 1.0);
+                            let _ = SetCursorPos(cx, cy);
+                        }
+                    }
+                }
+            }
+            (rx, ry, lt, rt)
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
