@@ -136,6 +136,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    if let Some(made) = p.made.get() {
+        return made.is_some();
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
