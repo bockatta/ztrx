@@ -373,12 +373,28 @@ pub(crate) fn rasterize_panel(
     line.push_str(" FPS)");
     draw_text_scaled(pixels, 14, 66, line.as_bytes(), text_hi, 2);
 
-    // Line 4 (y=88, 2x scale): self-timed overlay cost + F9 hotkey
+    // Line 4 (y=88, 2x scale): live shader/texture preload progress or ready status
+    let pso_making = crate::pipeline::making();
+    let tex_due = crate::draw::HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed);
+    let (async_pend, _) = crate::texture::async_counts();
     line.clear();
-    line.push_str("OVL ");
-    line.push_f2(last_us as f32 / 1000.0);
-    line.push_str("MS   [F9 HIDE]");
-    draw_text_scaled(pixels, 14, 88, line.as_bytes(), text_dim, 2);
+    let line4_col = if pso_making > 0 {
+        line.push_str("SHADERS ");
+        line.push_uint(pso_making as u32);
+        line.push_str(" LEFT  [F9]");
+        yellow
+    } else if tex_due >= 128 || async_pend > 0 {
+        line.push_str("LOAD TEX ");
+        line.push_uint(tex_due as u32);
+        line.push_str(" DUE  [F9]");
+        yellow
+    } else {
+        line.push_str("OVL ");
+        line.push_f2(last_us as f32 / 1000.0);
+        line.push_str("MS   [F9 HIDE]");
+        text_dim
+    };
+    draw_text_scaled(pixels, 14, 88, line.as_bytes(), line4_col, 2);
 
     // Sparkline graph box: x=12..500 (488 px = 122 bars x 4 px), y=112..188 (76 px tall).
     let (gx0, gy0, gw, gh) = (12usize, 112usize, SPARK_BARS * 4, 76usize);
@@ -548,6 +564,7 @@ fn glyph(ch: u8) -> [u8; 7] {
         b'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
         b'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
         b'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
+        b'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
         b'.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
         b'%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
         b'(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],

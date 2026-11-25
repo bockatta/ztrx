@@ -70,6 +70,8 @@ thread_local! {
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// Whether the current early texture pass is for a synchronous character bake draw.
+    static PASS_IS_BAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -1625,7 +1627,9 @@ impl State {
         }
         let began = std::time::Instant::now();
         PASS_BUDGET.set(Some(budget));
+        PASS_IS_BAKE.set(bake);
         self.heap_textures(list, heap, host);
+        PASS_IS_BAKE.set(false);
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -1856,20 +1860,25 @@ impl State {
                 crate::texture::AsyncDone::Skip { .. } => {}
             }
         }
-        let use_async = crate::texture::async_textures() && PASS_BUDGET.get().is_none() && room;
+        // Allow async COPY-queue streaming during BOTH world gameplay AND pre-game
+        // loading-screen `early_textures` passes (only synchronous character bakes
+        // keep `use_async = false` so source textures are bound before baking).
+        let is_early_load = PASS_BUDGET.get().is_some() && !PASS_IS_BAKE.get();
+        let use_async = crate::texture::async_textures() && !PASS_IS_BAKE.get() && room;
+        let async_limit = if is_early_load { 2048usize } else { 1024usize };
         let mut processed = 0usize;
         let mut async_queued = 0usize;
         let mut sync_budget_hit = false;
         for (index, write) in due {
             // Keep feeding fresh placed textures into the background COPY queue
-            // (up to 1024/frame, < 0.5 ms on render thread) even after the sync
-            // budget is reached so the async streamer never starves at 0 pending.
-            if sync_budget_hit && (!use_async || async_queued >= 1024) {
+            // (< 0.5 ms on render thread) even after the sync budget is reached
+            // so the async streamer stays saturated during loading & gameplay.
+            if sync_budget_hit && (!use_async || async_queued >= async_limit) {
                 break;
             }
             if !sync_budget_hit && (SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span) {
                 sync_budget_hit = true;
-                if !use_async || async_queued >= 1024 {
+                if !use_async || async_queued >= async_limit {
                     break;
                 }
             }
@@ -2129,14 +2138,60 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
-        // Initial scene-load drain gate (`VICTORY_LOAD_DRAIN=1`, default on):
-        // when entering a scene with a massive backlog (>= 1024 due slots),
-        // briefly wait for the background COPY-queue batch to land and bind its
-        // completed SRVs before presenting so the player doesn't spawn into an
-        // untextured prison. Bounded to the first 24 burst passes (0 ms in play).
+        // Pre-game shader & texture preload gate (`VICTORY_PRELOAD_GATE=1`, default on):
+        // During loading-screen frames (`is_early_load`, BEFORE any cutscene or 3D
+        // gameplay begins), drain the background COPY-queue for up to 180 ms per
+        // loading frame whenever textures are queued or shaders are still compiling,
+        // keeping the loading screen alive (zero watchdog risk) while uploading
+        // scene textures into VRAM before the cutscene starts.
+        static PRELOAD_GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let preload_on = *PRELOAD_GATE
+            .get_or_init(|| std::env::var_os("VICTORY_PRELOAD_GATE").is_none_or(|v| v != "0"));
+        if use_async
+            && preload_on
+            && is_early_load
+            && (census[1] >= 64 || crate::pipeline::making() > 0 || async_queued > 0)
+        {
+            crate::texture::async_drain_wait(180);
+            for done in crate::texture::take_async_ready() {
+                match done {
+                    crate::texture::AsyncDone::Unmapped { index, write } => {
+                        HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_gone(index);
+                        host.texture_slot_later(index, write, frame, most);
+                    }
+                    crate::texture::AsyncDone::Uploaded {
+                        index,
+                        write,
+                        handle,
+                        at,
+                        len,
+                        print,
+                        partly,
+                        bytes,
+                    } => {
+                        let _ = host.mirror(index, handle, true);
+                        let again = partly.map(|mapped| (frame + 1, mapped));
+                        if again.is_some() {
+                            HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                        HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                        HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+                        if again.is_none() && heap_recheck() {
+                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                        } else {
+                            host.texture_slot_done(index, write, again);
+                        }
+                    }
+                    crate::texture::AsyncDone::Skip { .. } => {}
+                }
+            }
+        }
+        // Optional world-entry drain gate (`VICTORY_LOAD_DRAIN=1`, off by default).
         static LOAD_DRAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static DRAIN_PASSES: AtomicU64 = AtomicU64::new(0);
         if use_async
+            && !is_early_load
             && async_queued > 0
             && census[1] >= 1024
             && *LOAD_DRAIN.get_or_init(|| std::env::var_os("VICTORY_LOAD_DRAIN").is_some_and(|v| v == "1"))

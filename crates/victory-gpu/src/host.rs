@@ -5897,6 +5897,80 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Offloads a title `CopyBufferRegion` onto the GPU when `src` or `dst` is
+    /// written by an in-flight shader (`VICTORY_GPU_COPY_BUFFER=1`, default on).
+    /// Eliminates the ~50-76 ms/frame `Step::Copy` CPU-GPU settle stall while
+    /// preserving exact title-RAM coherency via `dst_shadow.gpu_writes`.
+    pub(crate) fn gpu_copy_buffer(&self, dst_addr: u64, src_addr: u64, len: u64) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_COPY_BUFFER").is_none_or(|v| v != "0")) {
+            return false;
+        }
+        if len == 0 || !late() {
+            return false;
+        }
+        let src_in_flight = flights_write(src_addr as usize, (src_addr + len) as usize);
+        let dst_in_flight = flights_write(dst_addr as usize, (dst_addr + len) as usize);
+        if !src_in_flight && !dst_in_flight {
+            return false;
+        }
+        let Some(src_shadow) = crate::shadow::find(src_addr, len) else {
+            return false;
+        };
+        let Some(dst_shadow) = crate::shadow::find(dst_addr, len) else {
+            return false;
+        };
+        if dst_shadow.is_upload() || std::sync::Arc::ptr_eq(&src_shadow, &dst_shadow) {
+            return false;
+        }
+        let (Some(src_off), Some(dst_off)) = (src_shadow.offset_in(src_addr), dst_shadow.offset_in(dst_addr)) else {
+            return false;
+        };
+        if src_shadow.left(src_addr) < len || dst_shadow.left(dst_addr) < len {
+            return false;
+        }
+        // Keep both shadows alive for the list and bring any non-in-flight CPU
+        // bytes up to date on the source before copying on the GPU.
+        src_shadow.refresh(self, src_addr, len);
+        dst_shadow.refresh(self, dst_addr, len);
+        self.keep(&src_shadow.buffer);
+        self.keep(&dst_shadow.buffer);
+        let src_uav = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: unsafe { std::mem::transmute_copy(&src_shadow.buffer) },
+                }),
+            },
+            ..Default::default()
+        };
+        let dst_done = transition(
+            &dst_shadow.buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        // SAFETY: open command list; both buffers start in COMMON (implicit buffer
+        // promotion to COPY_SOURCE/COPY_DEST) and are kept alive by `self.keep`.
+        unsafe {
+            self.list.ResourceBarrier(&[src_uav]);
+            self.list.CopyBufferRegion(&dst_shadow.buffer, dst_off, &src_shadow.buffer, src_off, len);
+            self.list.ResourceBarrier(&[dst_done]);
+        }
+        dst_shadow.gpu_writes(self, dst_addr, len);
+        static COUNTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if COUNTED.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!(
+                dst = format_args!("{dst_addr:#x}"),
+                src = format_args!("{src_addr:#x}"),
+                len,
+                src_id = src_shadow.id(),
+                dst_id = dst_shadow.id(),
+                "offloaded in-flight CopyBufferRegion to GPU (0ms CPU settle)"
+            );
+        }
+        true
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();

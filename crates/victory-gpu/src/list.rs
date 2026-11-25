@@ -819,7 +819,9 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        if !list.gpu_copy_buffer(to as u64, from as u64, len) {
+            list.defer_copy(to, from, len as usize);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
