@@ -41,8 +41,12 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice on the host texture.
     mips: u32,
+    /// Top console mips skipped on the host texture (`VICTORY_TEXTURE_MIP_SKIP`).
+    mip_skip: u32,
+    /// Prefix of title memory containing every mip we detile (`<= layout.size`).
+    read_size: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -656,7 +660,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
-        (self.memory as usize, self.layout.size as usize)
+        (self.memory as usize, self.read_size)
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
@@ -679,7 +683,8 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
-        let size = self.layout.size as usize;
+        let full_size = self.layout.size as usize;
+        let size = self.read_size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
@@ -690,7 +695,7 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            with_read(size, |read| {
+            with_read(full_size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 self.detile(read);
             });
@@ -752,14 +757,14 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
+            let changed = with_read(full_size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = blake3::hash(&read[..size]);
                 if last.hash == Some(hash) {
                     return false;
                 }
                 last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if read[..size].iter().all(|&b| b == 0) {
                     return false;
                 }
                 self.detile(read);
@@ -773,19 +778,42 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+            return with_read(full_size, |read| {
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                let hash = blake3::hash(&read[..size]);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(tiled);
+                self.detile(read);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
             });
+        }
+        if size < full_size {
+            // Mip-skipped texture: only `[0..size)` is committed/needed;
+            // copy into the thread-local `full_size` buffer only on hash miss
+            // so `Layout::detile`'s length check holds without ever forming a
+            // slice over uncommitted mip-0 pages.
+            // SAFETY: committed memory of `size` bytes, held mapped by `_mapped`.
+            let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+            let hash = blake3::hash(tiled);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            if last.hash == Some(hash) {
+                return size;
+            }
+            last.hash = Some(hash);
+            with_read(full_size, |read| {
+                read[..size].copy_from_slice(tiled);
+                self.detile(read);
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            return size;
         }
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
@@ -811,11 +839,12 @@ impl Staging {
     /// Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+        let full_size = self.layout.size as usize;
+        let read = with_read(full_size, |read| {
+            if !crate::host::read_into(self.memory, &mut read[..size]) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = blake3::hash(&read[..size]);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -836,7 +865,7 @@ impl Staging {
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tiled[..self.read_size].iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -845,6 +874,7 @@ impl Staging {
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let console_mip = mip + self.mip_skip;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -854,9 +884,9 @@ impl Staging {
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, console_mip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, mip = console_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -937,7 +967,7 @@ pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    let size = s.layout.size as usize;
+    let size = s.read_size;
     Some((size as u64, committed(s.memory, size)))
 }
 
@@ -1147,6 +1177,21 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    let mip_skip = crate::resource::mip_skip(resource);
+    let read_size = if mip_skip > 0
+        && layout.slices == 1
+        && mip_skip <= layout.first_tail_mip
+        && (mip_skip as usize) < layout.mips.len()
+    {
+        let end = layout.mips[mip_skip as usize - 1].offset as usize;
+        if end > 0 && end <= layout.size as usize {
+            end
+        } else {
+            layout.size as usize
+        }
+    } else {
+        layout.size as usize
+    };
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
@@ -1156,6 +1201,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_skip,
+        read_size,
         bytes: total,
         memory,
         last: Mutex::default(),

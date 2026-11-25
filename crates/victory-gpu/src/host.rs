@@ -2427,17 +2427,11 @@ fn late_threads() {
 /// time flights have landed. Counted as a settle for `why`, and its time
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
-/// Threads currently blocked inside [`relay_wait`]; when zero, [`relay_worker`]
-/// may coalesce a tiny batch of flights for 3 ms to avoid redundant DMA fetches.
-static RELAY_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     let mut line = line();
     if done(&line) {
         return;
     }
-    RELAY_WAITERS.fetch_add(1, Ordering::AcqRel);
-    RELAY_MOVED.notify_one();
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
@@ -2445,7 +2439,6 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
-    RELAY_WAITERS.fetch_sub(1, Ordering::AcqRel);
     drop(line);
     stood(waiting);
     working(was_working);
@@ -2505,43 +2498,6 @@ fn relay_worker() {
                 if n == 0 {
                     // The first thing is a flight the card has not run.
                     break Err(fences[0].unwrap_or(0));
-                }
-                // If nobody is waiting on the relay and more flights are still
-                // finishing on the GPU, briefly coalesce small landings so we
-                // issue 1-2 DMA fetches per frame instead of 7+ separate waits.
-                if n < fences.len()
-                    && n < 12
-                    && RELAY_WAITERS.load(Ordering::Acquire) == 0
-                {
-                    let (guard, _) = RELAY_MOVED
-                        .wait_timeout(line, std::time::Duration::from_millis(3))
-                        .unwrap_or_else(|e| e.into_inner());
-                    line = guard;
-                    // Re-check landable after the brief coalesce pause.
-                    let fences2: Vec<Option<u64>> = line
-                        .line
-                        .iter()
-                        .map(|l| match l {
-                            Late::Run(flight) => Some(flight.fence),
-                            _ => None,
-                        })
-                        .collect();
-                    // SAFETY: a plain query.
-                    let completed2 = unsafe { host.fence.GetCompletedValue() };
-                    let n2 = landable(&fences2, completed2);
-                    if n2 == 0 {
-                        continue;
-                    }
-                    line.settling = true;
-                    let items: Vec<Late> = line.line.drain(..n2).collect();
-                    line.in_hand = items
-                        .iter()
-                        .filter_map(|l| match l {
-                            Late::Write(at, what, bytes) => Some((*at, *what, *bytes)),
-                            _ => None,
-                        })
-                        .collect();
-                    break Ok(items);
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();

@@ -1275,6 +1275,73 @@ fn fills(desc: &ResourceDesc) -> bool {
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// Top mip levels to drop on large placed 2D BC1-BC7 textures (`VICTORY_TEXTURE_MIP_SKIP`,
+/// default `1`; `0` disables, clamped `0..=2`). Dropping 1 top mip cuts VRAM, staging RAM,
+/// detile CPU time, and PCIe upload bytes by 4x on 512x512..4096x4096 world/character textures
+/// so 12 GB GPUs do not hit `the card has no room for more` and starve nearby meshes.
+#[cfg(windows)]
+fn mip_skip_setting() -> u32 {
+    static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_SKIP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(1, |n| n.min(2))
+    })
+}
+
+/// Whether `format` (a PC DXGI format) is a 4x4 block-compressed format (BC1-BC7).
+#[cfg(windows)]
+fn is_bc_format(format: u32) -> bool {
+    matches!(format, 70..=84 | 94..=99)
+}
+
+/// Top mip levels skipped on the host copy for `desc`, given `placed` (only
+/// bindless `View::Placed` textures, which the title never passes to
+/// `CopyResource` / `CopyTextureRegion`) and desired `max_skip`.
+#[cfg(windows)]
+fn mip_skip_with(desc: &ResourceDesc, placed: bool, max_skip: u32) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if max_skip == 0
+        || !placed
+        || !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.sample_count > 1
+        || desc.mip_levels < 4
+        || desc.width.max(u64::from(desc.height)) < 512
+        || !is_bc_format(pc_format(desc.format))
+    {
+        return 0;
+    }
+    let mut skip = max_skip.min(u32::from(desc.mip_levels).saturating_sub(3));
+    while skip > 0 {
+        let w = desc.width >> skip;
+        let h = desc.height >> skip;
+        if w >= 4 && h >= 4 && (w & 3) == 0 && (h & 3) == 0 {
+            return skip;
+        }
+        skip -= 1;
+    }
+    0
+}
+
+#[cfg(windows)]
+pub(crate) fn mip_skip_for(desc: &ResourceDesc, placed: bool) -> u32 {
+    mip_skip_with(desc, placed, mip_skip_setting())
+}
+
+/// Top mip levels skipped on the host copy of texture `this` (0 for all
+/// non-placed, non-BC, small, array, 3D, or render-target/UAV textures).
+#[cfg(windows)]
+pub(crate) fn mip_skip(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let r = resource(this);
+    mip_skip_for(&r.desc, r.host.placed.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Whether the title fills texture `this` itself ([`fills`]).
 #[cfg(windows)]
 pub(crate) fn title_fills(this: This) -> bool {
@@ -1326,7 +1393,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let skip = mip_skip_for(&r.desc, r.host.placed.load(Relaxed));
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear, skip) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1884,6 +1952,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    mip_skip: u32,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -1892,6 +1961,22 @@ fn host_texture(
     }
     let host = crate::host::host()?;
     let mut d = *desc;
+    if mip_skip > 0 {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        let (orig_w, orig_h, orig_mips) = (d.width, d.height, d.mip_levels);
+        d.width = (d.width >> mip_skip).max(4);
+        d.height = (d.height >> mip_skip).max(4);
+        d.mip_levels = d.mip_levels.saturating_sub(mip_skip as u16).max(1);
+        LOGGED.call_once(|| {
+            tracing::info!(
+                mip_skip,
+                first_orig = format_args!("{orig_w}x{orig_h} mips={orig_mips}"),
+                first_host = format_args!("{}x{} mips={}", d.width, d.height, d.mip_levels),
+                format = d.format,
+                "VICTORY_TEXTURE_MIP_SKIP active: skipping top mip(s) on large placed 2D BC textures (4x VRAM & streaming reduction per level)"
+            );
+        });
+    }
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
@@ -2314,6 +2399,35 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
+    }
+    footprint(&d).map(|f| f.size)
+}
+
+/// The bytes of title memory needed to upload a placed texture with description
+/// `desc`: equals [`placed_bytes`] when no top mips are skipped, or the prefix
+/// holding mips `skip..` (tail + smaller mips live first in console layouts)
+/// when `VICTORY_TEXTURE_MIP_SKIP` drops the largest mip(s).
+#[cfg(windows)]
+pub(crate) fn placed_needed_bytes(desc: &[u32; 14]) -> Option<u64> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let skip = mip_skip_for(&d, true);
+    if skip > 0
+        && let Some(t) = texture_layout(&d)
+    {
+        let layout = &t.planes[0].layout;
+        if layout.slices == 1
+            && skip <= layout.first_tail_mip
+            && (skip as usize) < layout.mips.len()
+        {
+            let end = layout.mips[skip as usize - 1].offset;
+            if end > 0 && end <= layout.size {
+                return Some(end);
+            }
+        }
     }
     footprint(&d).map(|f| f.size)
 }
@@ -3786,5 +3900,56 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mip_skip_applies_only_to_large_placed_2d_bc_textures() {
+        let mut bc7 = ResourceDesc {
+            dimension: 3, // TEXTURE_2D
+            alignment: 0,
+            width: 2048,
+            height: 2048,
+            depth_or_array_size: 1,
+            mip_levels: 12,
+            format: 98, // BC7_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x109, // SW_64KB_S
+            flags: 0,
+        };
+        assert_eq!(mip_skip_with(&bc7, true, 1), 1);
+        assert_eq!(mip_skip_with(&bc7, true, 2), 2);
+        assert_eq!(mip_skip_with(&bc7, true, 0), 0);
+        // Non-placed ID3D12Resource (can be CopyResource/CopyTextureRegion target): never skipped.
+        assert_eq!(mip_skip_with(&bc7, false, 1), 0);
+        // Placed needed bytes should be ~4x smaller than full console footprint when skip=1.
+        // SAFETY: plain 56-byte struct to 14 u32 words.
+        let words: [u32; 14] = unsafe { std::mem::transmute(bc7) };
+        let full = placed_bytes(&words).expect("full size");
+        let needed = placed_needed_bytes(&words).expect("needed size");
+        assert!(needed * 3 <= full, "expected ~4x reduction: full={full}, needed={needed}");
+        // Render target / UAV / depth: never skipped.
+        bc7.flags = 1;
+        assert_eq!(mip_skip_with(&bc7, true, 1), 0);
+        bc7.flags = 0;
+        // Texture array: never skipped.
+        bc7.depth_or_array_size = 2;
+        assert_eq!(mip_skip_with(&bc7, true, 1), 0);
+        bc7.depth_or_array_size = 1;
+        // Small texture (<512): never skipped.
+        bc7.width = 256;
+        bc7.height = 256;
+        assert_eq!(mip_skip_with(&bc7, true, 1), 0);
+        // Uncompressed RGBA8: never skipped.
+        bc7.width = 2048;
+        bc7.height = 2048;
+        bc7.format = 28;
+        assert_eq!(mip_skip_with(&bc7, true, 1), 0);
+        // Non-block-aligned after shift (516 >> 1 = 258, not multiple of 4): never skipped.
+        bc7.format = 98;
+        bc7.width = 516;
+        bc7.height = 512;
+        assert_eq!(mip_skip_with(&bc7, true, 1), 0);
     }
 }

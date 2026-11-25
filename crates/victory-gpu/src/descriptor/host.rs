@@ -2097,6 +2097,41 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Shifts a shader resource view's mip range and min-LOD clamp when the host
+/// texture dropped `skip` top mips (`VICTORY_TEXTURE_MIP_SKIP`).
+fn adjust_srv_mip_skip(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, host_mips: u32, skip: u32) {
+    if skip == 0 || host_mips == 0 {
+        return;
+    }
+    let shift = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        let orig_most = *most;
+        let orig_levels = *levels;
+        let new_most = orig_most.saturating_sub(skip).min(host_mips - 1);
+        *most = new_most;
+        if orig_levels != u32::MAX {
+            let orig_end = orig_most.saturating_add(orig_levels);
+            let new_end = orig_end.saturating_sub(skip).min(host_mips);
+            *levels = new_end.saturating_sub(new_most).max(1).min(host_mips - new_most);
+        }
+        *clamp = (*clamp - skip as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: union member matches `ViewDimension`.
+            let mut v = unsafe { desc.Anonymous.Texture2D };
+            shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            desc.Anonymous.Texture2D = v;
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: union member matches `ViewDimension`.
+            let mut v = unsafe { desc.Anonymous.Texture2DArray };
+            shift(&mut v.MostDetailedMip, &mut v.MipLevels, &mut v.ResourceMinLODClamp);
+            desc.Anonymous.Texture2DArray = v;
+        }
+        _ => {}
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2149,6 +2184,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                let skip = crate::resource::mip_skip(resource);
+                if skip > 0
+                    && let Some(ref mut d) = desc
+                {
+                    // SAFETY: a live texture.
+                    let host_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    adjust_srv_mip_skip(d, host_mips, skip);
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -2900,5 +2943,49 @@ mod tests {
         // Release dynamic slots 6..10 (host 10..14), crossing cursor at dynamic 8!
         heap.release(10, 4);
         assert_eq!(heap.dynamic(4), Some(10));
+    }
+
+    #[test]
+    fn srv_mip_skip_shifts_mip_range_and_lod_clamp() {
+        let make_2d = |most: u32, levels: u32, clamp: f32| {
+            let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT(98),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            d.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MostDetailedMip: most,
+                MipLevels: levels,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: clamp,
+            };
+            d
+        };
+        // Full chain (console 12 mips -> host 11 mips after skip=1) with min-LOD clamp 2.5.
+        let mut full = make_2d(0, 12, 2.5);
+        adjust_srv_mip_skip(&mut full, 11, 1);
+        let v = unsafe { full.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels), (0, 11));
+        assert!((v.ResourceMinLODClamp - 1.5).abs() < 1e-6);
+
+        // Streaming view starting at console mip 3 (9 mips) -> host mip 2 (9 mips).
+        let mut streamed = make_2d(3, 9, 0.0);
+        adjust_srv_mip_skip(&mut streamed, 11, 1);
+        let v = unsafe { streamed.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels), (2, 9));
+        assert_eq!(v.ResourceMinLODClamp, 0.0);
+
+        // Single-mip view of console mip 0 -> clamped to host mip 0, 1 level.
+        let mut top_only = make_2d(0, 1, 0.0);
+        adjust_srv_mip_skip(&mut top_only, 11, 1);
+        let v = unsafe { top_only.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels), (0, 1));
+
+        // Unlimited mip count (u32::MAX) stays u32::MAX.
+        let mut unlim = make_2d(2, u32::MAX, 1.0);
+        adjust_srv_mip_skip(&mut unlim, 11, 1);
+        let v = unsafe { unlim.Anonymous.Texture2D };
+        assert_eq!((v.MostDetailedMip, v.MipLevels, v.ResourceMinLODClamp), (1, u32::MAX, 0.0));
     }
 }
