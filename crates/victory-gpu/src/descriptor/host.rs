@@ -889,7 +889,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { end + n.saturating_sub(1) } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -2889,17 +2889,16 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        // Allocate slots 0..8, advancing cursor to 8.
+        // Fill the entire dynamic range, leaving cursor at 12 (dynamic offset 8).
         let a = heap.dynamic(8).unwrap();
-        // Allocate slots 8..16, advancing cursor to 16.
-        let b = heap.dynamic(8).unwrap();
+        let b = heap.dynamic(heap.dynamic - 8).unwrap();
         assert_eq!((a, b), (4, 12));
+        // Advance cursor to dynamic offset 8 by releasing and re-allocating 0..8.
+        heap.release(a, 8);
+        assert_eq!(heap.dynamic(8), Some(4));
 
-        // Release slots 10..14 (crossing cursor at 12).
-        // Before the fix, a request of 4 slots starting search at 12 scanned 12..end then 0..12,
-        // missing the contiguous run at 10..14.
-        heap.release(14, 4);
-        let c = heap.dynamic(4);
-        assert_eq!(c, Some(14));
+        // Release dynamic slots 6..10 (host 10..14), crossing cursor at dynamic 8!
+        heap.release(10, 4);
+        assert_eq!(heap.dynamic(4), Some(10));
     }
 }
