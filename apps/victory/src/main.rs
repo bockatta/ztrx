@@ -14,6 +14,22 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[cfg(windows)]
+mod agility_sdk {
+    #[repr(transparent)]
+    pub struct SdkPath(*const core::ffi::c_char);
+    // SAFETY: Points to a static NUL-terminated ASCII string literal.
+    unsafe impl Sync for SdkPath {}
+
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKVersion: u32 = 620;
+
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
+}
+
 #[derive(Parser)]
 #[command(
     name = "victory",

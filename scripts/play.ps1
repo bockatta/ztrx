@@ -3,8 +3,11 @@ param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",
     [string]$Data = "$env:LOCALAPPDATA\ztrx\data",
-    [string]$Exe = "$PSScriptRoot\..\target\release\victory.exe"
+    [string]$Exe = ""
 )
+if (-not $Exe) {
+    $Exe = Join-Path (Split-Path $PSScriptRoot -Parent) "target\release\victory.exe"
+}
 foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VICTORY_DUMP_TARGETS") {
     Remove-Item "Env:$v" -ErrorAction SilentlyContinue
 }
