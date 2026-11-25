@@ -369,7 +369,7 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
-/// Passes that made no texture because the card had no room
+/// Passes that deferred a new texture copy because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
@@ -1565,7 +1565,7 @@ impl State {
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
-    fn heap_textures(
+    pub(crate) fn heap_textures(
         &self,
         list: &HostList,
         heap: &crate::descriptor::Heap,
@@ -1588,19 +1588,7 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
-        // No more of them are made while the card has no room
-        // (`resource::room`): by what is alive now, not by what was ever
-        // staged (4 GB in all, after which later textures stayed empty for
-        // the run). The ones nothing names any more are let go, which
-        // makes room again: so the slots are still looked at (the pass
-        // returned here, and a slot whose texture had been streamed out
-        // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
-        if !room {
-            HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
-            once!("textures picked by index: the card has no room for more; they wait");
-        }
-        let mut refused = 0;
+        let mut reported_full = false;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -1701,10 +1689,12 @@ impl State {
                     );
                 }
             }
+            let handle = heap.handle(index);
+            let view = handle.and_then(crate::descriptor::view);
             let mut partly = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            if let Some(View::Placed(false, resource, desc)) = &view {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
+                let len = crate::resource::placed_bytes(resource).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
@@ -1725,27 +1715,37 @@ impl State {
                     partly = Some(mapped);
                 }
             }
-            // A texture object the host renders to or writes holds the
-            // host's own contents: nothing to bring up to date, and this
-            // pass is no use of it (its host copy is made when something
-            // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
-                && crate::resource::buffer_bytes(object as This).is_none()
-                && !crate::resource::title_fills(object as This)
-            {
-                host.texture_slot_done(index, write, None);
-                continue;
-            }
-            // From here on a host texture is made: not without room. The
-            // slot stays due.
-            if !room {
-                refused += 1;
-                if refused > 256 {
-                    break;
+            let needs_copy = match &view {
+                Some(View::Shader(object, _)) => {
+                    let resource = *object as This;
+                    if crate::resource::buffer_bytes(resource).is_some() {
+                        false
+                    } else if crate::resource::title_fills(resource) {
+                        !crate::resource::has_host_copy(resource)
+                    } else {
+                        // This texture holds the host's own contents.
+                        host.texture_slot_done(index, write, None);
+                        continue;
+                    }
+                }
+                Some(View::Placed(false, resource, desc)) => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    !crate::resource::placed_has_host_copy(address, resource)
+                }
+                _ => false,
+            };
+            // Mirror may create the host copy. Check live bytes here, after
+            // any earlier creations in the pass. Keep deferred slots due and
+            // keep visiting the queue for copies that are already on the host.
+            if needs_copy && !crate::resource::room() {
+                if !reported_full {
+                    reported_full = true;
+                    HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+                    once!("textures picked by index: the card has no room for more; they wait");
                 }
                 continue;
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = handle.and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,

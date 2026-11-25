@@ -1284,6 +1284,18 @@ pub(crate) fn host_waits(this: This) -> bool {
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
+/// Whether the texture already has a host copy, without recording a use.
+#[cfg(windows)]
+pub(crate) fn has_host_copy(this: This) -> bool {
+    !this.is_null()
+        && resource(this)
+            .host
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+}
+
 /// The host side of title texture `this`: made now if it is not there and
 /// `make` says so. `None` for buffers and for textures the host refuses.
 #[cfg(windows)]
@@ -2067,23 +2079,38 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+/// The description used in the placed texture cache key.
+#[cfg(windows)]
+fn placed_texture_key(mut desc: [u32; 14]) -> [u32; 14] {
+    // Words 1 and 13 are layout padding. Two views that differ only
+    // there share a resource and its host copy.
+    // `VICTORY_PLACED_FILLER=1` keeps the padding in the key.
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        desc[1] = 0;
+        desc[13] = 0;
+    }
+    desc
+}
+
+/// Whether a placed texture already has a host copy, without registering
+/// an unseen texture. Admission and creation use the same cache key.
+#[cfg(windows)]
+pub(crate) fn placed_has_host_copy(address: u64, desc: &[u32; 14]) -> bool {
+    let placed = PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, placed_texture_key(*desc)))
+        .copied();
+    placed.is_some_and(|resource| has_host_copy(resource as This))
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    // Words 1 and 13 of the description are the filler of its layout
-    // (after the dimension, and at the end): the title leaves there what
-    // its stack held, and two views of one texture that differed only in
-    // them each got a resource and a host copy of their own, on a card
-    // that fills at world entry. They are not part of what a texture is.
-    // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
-    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let raw = *desc;
-    let mut key = *desc;
-    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
-        key[1] = 0;
-        key[13] = 0;
-    }
+    let key = placed_texture_key(raw);
     let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
@@ -2091,12 +2118,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
-            let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
-                let mut blank = *r;
-                blank[1] = 0;
-                blank[13] = 0;
-                blank == key
-            });
+            let others = seen
+                .range((address, [0; 14])..=(address, [u32::MAX; 14]))
+                .filter(|(_, r)| placed_texture_key(*r) == key);
             if others.count() > 1 {
                 PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
