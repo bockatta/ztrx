@@ -1556,6 +1556,13 @@ impl State {
         }
         let bake = bake_ms > 0
             && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        // Issue #594: `PS_BakeDecorations_*` can fire 128+ times after the
+        // initial character bake when `due == 0`, halving world FPS. Once the
+        // initial bake passes have run, skip further bake storms unless due
+        // slots are actually waiting.
+        let bake = bake
+            && (EARLY_TEXTURE_PASSES[1].load(Ordering::Relaxed) < 4
+                || HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed) > 0);
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         // The milliseconds this frame's bake draws have taken so far: a
         // frame has several, and together they get `bake_ms`.

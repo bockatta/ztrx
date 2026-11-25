@@ -955,32 +955,29 @@ void main() {
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
-        const RING_HEADER: usize = 64 << 10;
-        const RING_STRIDE: usize = (64 << 10) + 64;
-        const RING_SLOTS: u32 = 4;
-        let (_ring, ring_ptr, ring_gpu) =
-            warp.shared_buffer(RING_HEADER as u64 + u64::from(RING_SLOTS) * RING_STRIDE as u64);
+        let (_meta, _, meta_gpu) = warp.shared_buffer(256);
+        let (_staged, _, staged_gpu) = warp.shared_buffer(u64::from(crate::host::CARD_STAGE_STRIDE) * 2);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
         // One pass over the three pieces; what it left in `differs` (7s
         // where it stored nothing).
-        let run = |warp: &mut WarpHarness, mode: u32, max_slots: u32| -> [u32; 3] {
+        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
-                ring_ptr.cast::<u32>().write_volatile(0);
                 for piece in 0..PIECES as usize {
                     differs_ptr.cast::<u32>().add(piece).write_volatile(7);
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode, max_slots];
-                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, 0, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.SetComputeRootUnorderedAccessView(4, ring_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, meta_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(5, staged_gpu);
                 warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
@@ -991,28 +988,187 @@ void main() {
         // SAFETY (each): inside the mapping.
         let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         // 0: the hashes are stored, nothing is flagged.
-        assert_eq!(run(&mut warp, 0, 0), [7, 7, 7]);
-        assert_eq!(run(&mut warp, 1, 0), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
         // A change in the second piece: flagged, and with 1 flagged again
         // (the hash stays the old one).
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1, 0), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1, 0), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
         // Changed back: with 1 the piece looks untouched.
         set(content[at]);
-        assert_eq!(run(&mut warp, 1, 0), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
         // With 2 the change is flagged once, and the hash is the new one.
         set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2, 0), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2, 0), [0, 0, 0]);
-        // Changed back with inline scatter-fetch enabled (`max_slots = 4`):
-        // slot 0 is claimed (`differs[1] == 2`) and all 64 KiB match bit-for-bit.
-        set(content[at]);
-        assert_eq!(run(&mut warp, 2, RING_SLOTS), [0, 2, 0]);
-        assert_eq!(unsafe { ring_ptr.cast::<u32>().read_volatile() }, 1);
-        let copied = unsafe { std::slice::from_raw_parts(ring_ptr.add(RING_HEADER), PIECE) };
-        assert_eq!(copied, &content[PIECE..2 * PIECE]);
-        assert_eq!(run(&mut warp, 2, RING_SLOTS), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// WARP D3D12 execution test for `CARD_COMPARE` inline staging:
+    /// (a) unaligned `skew = 0x1004` (piece widened to 65,552 bytes > 64 KiB)
+    ///     stages every byte identically into the ring without overflow,
+    /// (b) when `ring_slots = 2` is full, the 3rd differing piece sets
+    ///     `CARD_DIFF_OVERFLOW_BIT | idx` and does NOT overwrite slots 0..2,
+    /// (c) advancing `read_tail` past the overflowed index immediately reclaims
+    ///     the ring for the next compare pass.
+    #[test]
+    fn warp_card_compare_inline_stages_and_handles_ring_overflow() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 4;
+        const SKEW: u32 = 0x1004;
+        const RING_SLOTS: u32 = 2;
+        const STRIDE: usize = crate::host::CARD_STAGE_STRIDE as usize;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let (_meta, meta_ptr, meta_gpu) = warp.shared_buffer(256);
+        let (_staged, staged_ptr, staged_gpu) = warp.shared_buffer((STRIDE * RING_SLOTS as usize) as u64);
+        // Also verify dedicated COPY queue readback from a DEFAULT-heap VRAM staging buffer
+        // into a canonical D3D12_HEAP_TYPE_READBACK buffer with explicit UAV -> COMMON barrier.
+        let copy_queue: ID3D12CommandQueue = unsafe {
+            warp.device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })
+                .expect("WARP must support D3D12_COMMAND_LIST_TYPE_COPY")
+        };
+        let copy_alloc: ID3D12CommandAllocator =
+            unsafe { warp.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).unwrap() };
+        let copy_cmd: ID3D12GraphicsCommandList =
+            unsafe { warp.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &copy_alloc, None).unwrap() };
+        unsafe { copy_cmd.Close().unwrap() };
+        let copy_fence: ID3D12Fence = unsafe { warp.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+        let copy_event = unsafe { CreateEventW(None, false, false, None).unwrap() };
+        let rb_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let rb_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: (STRIDE * RING_SLOTS as usize) as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        let mut rb_opt: Option<ID3D12Resource> = None;
+        let mut rb_ptr = std::ptr::null_mut();
+        unsafe {
+            warp.device
+                .CreateCommittedResource(
+                    &rb_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rb_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb_opt,
+                )
+                .unwrap();
+            rb_opt.as_ref().unwrap().Map(0, None, Some(&mut rb_ptr)).unwrap();
+        }
+        let readback = rb_opt.unwrap();
+        let readback_ptr = rb_ptr.cast::<u8>();
+        let mut content: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(37) ^ (i >> 7)) as u8).collect();
+        // SAFETY: mappings hold their allocated sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size);
+            meta_ptr.cast::<u32>().write_volatile(0);
+        }
+        let run = |warp: &mut WarpHarness, mode: u32, read_tail: u32| -> [u32; 4] {
+            unsafe {
+                for p in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(p).write_volatile(0);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, SKEW, size as u32, PIECES, 0, mode, read_tail, RING_SLOTS];
+                warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, meta_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(5, staged_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            [0, 1, 2, 3].map(|p| unsafe { differs_ptr.cast::<u32>().add(p).read_volatile() })
+        };
+        // Baseline hash pass.
+        run(&mut warp, 0, 0);
+        // Mutate pieces 1, 2, and 3 (3 pieces > RING_SLOTS=2): 2 must stage, 1 must overflow.
+        let mut_offsets = [
+            PIECE - SKEW as usize + 123,
+            2 * PIECE - SKEW as usize + 555,
+            3 * PIECE - SKEW as usize + 999,
+        ];
+        for &off in &mut_offsets {
+            content[off] ^= 0xA5;
+            unsafe { now_ptr.add(off).write_volatile(content[off]) };
+        }
+        let res = run(&mut warp, 2, 0);
+        assert_eq!(res[0], 0, "untouched piece 0 must stay 0");
+        let mut staged_count = 0;
+        let mut overflow_count = 0;
+        let mut max_idx = 0u32;
+        for p in 1..4usize {
+            let d = res[p];
+            let idx = d & crate::host::CARD_DIFF_SLOT_MASK;
+            max_idx = max_idx.max(idx);
+            if (d & crate::host::CARD_DIFF_STAGED_BIT) != 0 {
+                staged_count += 1;
+                let raw_lo = (p * PIECE).saturating_sub(SKEW as usize);
+                let raw_hi = ((p + 1) * PIECE - SKEW as usize).min(size);
+                let shader_lo = raw_lo & !15;
+                let shader_hi = (raw_hi + 15) & !15;
+                assert_eq!(shader_hi - shader_lo, 65552, "skewed interior piece spans 65552 bytes");
+                let slot_base = (idx & (RING_SLOTS - 1)) as usize * STRIDE;
+                let got = unsafe { std::slice::from_raw_parts(staged_ptr.add(slot_base), shader_hi - shader_lo) };
+                assert_eq!(got, &content[shader_lo..shader_hi], "staged bytes for piece {p} must match bit-for-bit");
+            } else {
+                assert_ne!(d & crate::host::CARD_DIFF_OVERFLOW_BIT, 0, "overflowed piece {p} must carry overflow bit");
+                overflow_count += 1;
+            }
+        }
+        assert_eq!(staged_count, 2);
+        assert_eq!(overflow_count, 1);
+        assert_eq!(max_idx, 2);
+        // Advance read_tail past the overflowed index (2 + 1 = 3): ring must reclaim cleanly.
+        let off0 = 77usize;
+        content[off0] ^= 0x5A;
+        unsafe { now_ptr.add(off0).write_volatile(content[off0]) };
+        let res2 = run(&mut warp, 2, max_idx + 1);
+        assert_eq!(res2[1..4], [0, 0, 0]);
+        assert_ne!(res2[0] & crate::host::CARD_DIFF_STAGED_BIT, 0, "reclaimed ring must stage piece 0");
+        let idx0 = res2[0] & crate::host::CARD_DIFF_SLOT_MASK;
+        assert_eq!(idx0, 3);
+        let raw_hi0 = PIECE - SKEW as usize;
+        let shader_hi0 = (raw_hi0 + 15) & !15;
+        let slot_base0 = (idx0 & (RING_SLOTS - 1)) as usize * STRIDE;
+        let got0 = unsafe { std::slice::from_raw_parts(staged_ptr.add(slot_base0), shader_hi0) };
+        assert_eq!(got0, &content[0..shader_hi0], "reclaimed piece 0 must match bit-for-bit");
+        // Verify COPY queue readback of the staged slot into `readback` matches bit-for-bit.
+        unsafe {
+            copy_alloc.Reset().unwrap();
+            copy_cmd.Reset(&copy_alloc, None).unwrap();
+            copy_cmd.CopyBufferRegion(&readback, 0, &_staged, slot_base0 as u64, shader_hi0 as u64);
+            copy_cmd.Close().unwrap();
+            let lists = [Some(copy_cmd.cast::<ID3D12CommandList>().unwrap())];
+            copy_queue.ExecuteCommandLists(&lists);
+            copy_queue.Signal(&copy_fence, 1).unwrap();
+            copy_fence.SetEventOnCompletion(1, copy_event).unwrap();
+            WaitForSingleObject(copy_event, INFINITE);
+        }
+        let got_copy = unsafe { std::slice::from_raw_parts(readback_ptr, shader_hi0) };
+        assert_eq!(got_copy, &content[0..shader_hi0], "COPY queue readback must match bit-for-bit");
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
