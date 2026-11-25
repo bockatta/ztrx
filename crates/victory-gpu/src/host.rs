@@ -6798,6 +6798,7 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    overlay: crate::overlay::OverlayGpu,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -6828,7 +6829,7 @@ impl Meter {
     }
 
     /// Counts a presented frame.
-    fn frame(&mut self, hwnd: HWND) {
+    fn frame(&mut self, hwnd: HWND, frame: u64, stats: crate::overlay::FrameStats) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -6929,6 +6930,27 @@ impl Meter {
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
         let drops = crate::pipeline::take_drops();
+        let cs_waits_now = crate::draw::COMPUTE_WAITS.swap(0, Ordering::Relaxed);
+        let pso_making_now = crate::pipeline::making();
+        crate::perf_log::record_aggregate(&crate::perf_log::FrameAgg {
+            frame,
+            stats,
+            draws,
+            dropped,
+            cpu_prep_ms: cpu,
+            cpu_copies_ms: copy_ms,
+            cpu_copies_mb: copy_mb,
+            cpu_tex_ms: texture_ms,
+            cpu_tex_mb: texture_mb,
+            cpu_heap_ms: picked_ms,
+            cpu_heap_slots_ms: picked_look,
+            cpu_heap_tex_ms: picked_tex,
+            gpu_wait_ms: gpu,
+            copyback_ms: back_ms,
+            copyback_mb: back_mb,
+            pso_making: pso_making_now,
+            compute_waits: cs_waits_now,
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -7008,8 +7030,8 @@ impl Meter {
                     crate::resource::PLANES[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[2].load(Ordering::Relaxed)
                 ),
-                making = crate::pipeline::making(),
-                cs_waits = crate::draw::COMPUTE_WAITS.swap(0, Ordering::Relaxed),
+                making = pso_making_now,
+                cs_waits = cs_waits_now,
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
@@ -7168,6 +7190,17 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            crate::perf_log::poll_verbosity_toggle(p.hwnd);
+            let frame_stats = p.overlay.on_present(
+                self,
+                list,
+                &back,
+                index,
+                width,
+                height,
+                format,
+                p.hwnd,
+            );
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -7197,7 +7230,7 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            p.meter.frame(p.hwnd);
+            p.meter.frame(p.hwnd, frame, frame_stats);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
@@ -7248,6 +7281,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                overlay: crate::overlay::OverlayGpu::new(),
             })
         }
     }

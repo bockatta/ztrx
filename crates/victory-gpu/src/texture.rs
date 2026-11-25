@@ -1408,6 +1408,16 @@ struct AsyncStreamer {
 static ASYNC_STATE: Mutex<Option<AsyncStreamer>> = Mutex::new(None);
 static ASYNC_WAKE: std::sync::Condvar = std::sync::Condvar::new();
 static ASYNC_STARTED: std::sync::Once = std::sync::Once::new();
+static ASYNC_PENDING_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ASYNC_UPLOADED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns `(pending_jobs, total_async_uploaded)` for structured perf telemetry.
+pub(crate) fn async_counts() -> (u64, u64) {
+    (
+        ASYNC_PENDING_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        ASYNC_UPLOADED_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 
 /// Enqueues a new placed texture for background detile + dedicated `COPY`-queue
 /// upload. Returns true if queued or already in-flight (render thread moves on
@@ -1435,6 +1445,7 @@ pub(crate) fn enqueue_async_placed(job: AsyncJob) -> bool {
     }
     s.in_flight.insert(key);
     s.pending.push_back(job);
+    ASYNC_PENDING_COUNT.store(s.pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
     ASYNC_WAKE.notify_one();
     true
 }
@@ -1572,7 +1583,9 @@ fn async_streamer_loop() {
             }
             let s = state.as_mut().unwrap();
             let take = s.pending.len().min(24);
-            (0..take).filter_map(|_| s.pending.pop_front()).collect()
+            let taken: Vec<AsyncJob> = (0..take).filter_map(|_| s.pending.pop_front()).collect();
+            ASYNC_PENDING_COUNT.store(s.pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            taken
         };
         if jobs.is_empty() {
             continue;
@@ -1621,6 +1634,7 @@ fn async_streamer_loop() {
                                     (job.address as usize, (job.address as usize).saturating_add(read_size)),
                                 );
                         }
+                        ASYNC_UPLOADED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         done_now.push(AsyncDone::Uploaded {
                             index: job.index,
                             write: job.write,
@@ -1708,7 +1722,7 @@ fn async_streamer_loop() {
             }
             // Read title memory without ever blocking on remaps: try in-place read lock,
             // fall back to sparse copy_mapped.
-            let mut print = 1u64;
+            let print;
             let detiled = if partly.is_none()
                 && let Some(_reading) = crate::watch::title_memory_reading_now()
                 && committed(job.address as *const u8, read_size)
