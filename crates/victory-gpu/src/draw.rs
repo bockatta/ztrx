@@ -468,6 +468,17 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    if crate::host::fill_on_card()
+        && crate::host::late()
+        && (crate::host::flights_write(address as usize, address as usize + len as usize)
+            || crate::host::is_gpu_written_cbv_page(address, len))
+        && let Some(gpu) = {
+            shadow.refresh(list, address, len);
+            list.card_constants(&shadow, address, len)
+        }
+    {
+        return Some(gpu);
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -1810,6 +1821,42 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        // Step 1: drain textures finished by the background COPY-queue streamer
+        // (< 0.5 ms on render thread — GPU textures are already uploaded and in COMMON).
+        for done in crate::texture::take_async_ready() {
+            match done {
+                crate::texture::AsyncDone::Unmapped { index, write } => {
+                    HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    host.texture_slot_gone(index);
+                    host.texture_slot_later(index, write, frame, most);
+                }
+                crate::texture::AsyncDone::Uploaded {
+                    index,
+                    write,
+                    handle,
+                    at,
+                    len,
+                    print,
+                    partly,
+                    bytes,
+                } => {
+                    let _ = host.mirror(index, handle, true);
+                    let again = partly.map(|mapped| (frame + 1, mapped));
+                    if again.is_some() {
+                        HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                    HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+                    if again.is_none() && heap_recheck() {
+                        host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    } else {
+                        host.texture_slot_done(index, write, again);
+                    }
+                }
+                crate::texture::AsyncDone::Skip { .. } => {}
+            }
+        }
+        let use_async = crate::texture::async_textures() && PASS_BUDGET.get().is_none() && room;
         let mut processed = 0usize;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
@@ -1847,6 +1894,12 @@ impl State {
                     continue;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                if let Some(View::Placed(false, rdesc, d)) = heap.handle(index).and_then(crate::descriptor::view) {
+                    let addr = u64::from(d[10]) | u64::from(d[11]) << 32;
+                    if let Some(r) = crate::resource::placed_known(addr, &rdesc) {
+                        crate::texture::unmark_async_uploaded(r as usize);
+                    }
+                }
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
                         slot = index,
@@ -1861,6 +1914,29 @@ impl State {
             }
             let handle = heap.handle(index);
             let view = handle.and_then(crate::descriptor::view);
+            // Offload brand-new placed textures to the dedicated background COPY-queue
+            // streamer so the render thread never stalls detiling/uploading them.
+            if use_async
+                && let Some(h) = handle
+                && let Some(View::Placed(false, resource_desc, desc)) = &view
+                && host.texture_slot_checked(index).is_none()
+                && host.texture_slot_mapped(index) == 0
+            {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if !crate::resource::placed_has_host_copy(address, resource_desc) {
+                    let len = crate::resource::placed_needed_bytes(resource_desc).unwrap_or(1);
+                    if crate::texture::enqueue_async_placed(crate::texture::AsyncJob {
+                        index,
+                        write,
+                        handle: h,
+                        address,
+                        desc: *resource_desc,
+                        len,
+                    }) {
+                        continue;
+                    }
+                }
+            }
             let mut partly = None;
             if let Some(View::Placed(false, resource, desc)) = &view {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -2650,7 +2726,8 @@ impl State {
                     Some(View::Constant(address, size))
                         if crate::host::fill_on_card()
                             && crate::host::late()
-                            && crate::host::flights_write(address as usize, address as usize + size as usize)
+                            && (crate::host::flights_write(address as usize, address as usize + size as usize)
+                                || crate::host::is_gpu_written_cbv_page(address, u64::from(size)))
                             && let Some(shadow) = crate::shadow::find(address, u64::from(size))
                             && let Some(gpu) = {
                                 shadow.refresh(list, address, u64::from(size));

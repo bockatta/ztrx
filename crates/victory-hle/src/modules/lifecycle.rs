@@ -73,7 +73,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = fit_window(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -99,7 +99,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (style, x, y, width, height) = fit_window(parent, style, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -108,6 +108,39 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// With `VICTORY_BORDERLESS=1`, opens the top-level title window as borderless
+/// fullscreen covering 100% of the primary monitor's native resolution (e.g.
+/// 2560x1440) instead of a shrunk bordered window.
+fn fit_window(
+    parent: HWND,
+    style: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (u32, i32, i32, i32, i32) {
+    if parent.is_null()
+        && std::env::var_os("VICTORY_BORDERLESS").is_some_and(|v| v == "1")
+    {
+        // SAFETY: plain screen metric queries.
+        let (sw, sh) = unsafe {
+            (
+                wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            )
+        };
+        if sw > 0 && sh > 0 {
+            let popup = (style & !(wm::WS_CAPTION | wm::WS_THICKFRAME | wm::WS_MINIMIZEBOX | wm::WS_MAXIMIZEBOX | wm::WS_SYSMENU))
+                | wm::WS_POPUP
+                | wm::WS_VISIBLE;
+            tracing::info!(width, height, to = ?(sw, sh), "title window set to borderless fullscreen");
+            return (popup, 0, 0, sw, sh);
+        }
+    }
+    let (x, y, width, height) = fit(parent, x, y, width, height);
+    (style, x, y, width, height)
 }
 
 /// A console title sizes its window to its render target (

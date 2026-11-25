@@ -2427,6 +2427,55 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 /// [`late_blocked`] against `written` (joined), `by_copy` (per owner), and
 /// `immed` (bottom-of-pipe writes); `count` whether the kind of read is
 /// counted for the frame line.
+/// 64 KiB title-memory pages where a `Step::Fill` (CPU constant-buffer upload)
+/// actually collided with an in-flight shader write. Recording ONLY those few
+/// pages (typically 1-3 in the entire world) lets `draw.rs` route those exact
+/// CBVs through `list.card_constants()` on all subsequent frames without
+/// touching normal CBVs or overflowing the card-constants buffer.
+static GPU_WRITTEN_CBV_PAGES: std::sync::RwLock<Option<std::collections::HashSet<usize>>> =
+    std::sync::RwLock::new(None);
+static GPU_WRITTEN_CBV_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn note_gpu_written_cbv_page(src: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let first = src >> 16;
+    let last = src.saturating_add(len).saturating_sub(1) >> 16;
+    let mut set = GPU_WRITTEN_CBV_PAGES.write().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(std::collections::HashSet::new);
+    if set.len() >= 128 {
+        return;
+    }
+    let before = set.len();
+    for p in first..=last {
+        set.insert(p);
+    }
+    if set.len() != before {
+        GPU_WRITTEN_CBV_COUNT.store(set.len(), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn is_gpu_written_cbv_page(address: u64, len: u64) -> bool {
+    if len == 0 || GPU_WRITTEN_CBV_COUNT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let first = (address as usize) >> 16;
+    let last = (address.saturating_add(len).saturating_sub(1) as usize) >> 16;
+    let set = GPU_WRITTEN_CBV_PAGES.read().unwrap_or_else(|e| e.into_inner());
+    let Some(set) = set.as_ref() else {
+        return false;
+    };
+    (first..=last).any(|p| set.contains(&p))
+}
+
+/// Opt-in PR #191 aliased-copy wait under `VICTORY_RELAY=2` (`VICTORY_RELAY_ALIAS_WAIT=1`;
+/// off by default because it adds ~2 settles / ~40 ms per world frame).
+fn relay_alias_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_ALIAS_WAIT").is_some_and(|v| v == "1"))
+}
+
 fn blocked_by(
     written: &[(usize, usize)],
     by_copy: &[(usize, usize, usize)],
@@ -2451,6 +2500,7 @@ fn blocked_by(
                 }
                 &Step::Fill(_, src, len) => {
                     if any_written(src, src + len) {
+                        note_gpu_written_cbv_page(src, len);
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             static NAMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2460,7 +2510,7 @@ fn blocked_by(
                                     src = format_args!("{src:#x}"),
                                     len,
                                     copy = ?copy.map(|(a, l)| format!("{a:#x}+{l:#x}")),
-                                    "a fill of upload memory reads what a flight writes"
+                                    "a fill of upload memory reads what a flight writes (page learned for card_constants)"
                                 );
                             }
                         }
@@ -2477,13 +2527,15 @@ fn blocked_by(
                     }
                 }
                 Step::Refresh(shadow, address, len) => {
-                    let (from, to) = (*address, *address + *len);
-                    let copy = std::sync::Arc::as_ptr(shadow) as usize;
-                    if touches_other(written, by_copy, copy, from, to) || touches(immed, from, to) {
-                        if count {
-                            LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+                    if relay_alias_wait() {
+                        let (from, to) = (*address, *address + *len);
+                        let copy = std::sync::Arc::as_ptr(shadow) as usize;
+                        if touches_other(written, by_copy, copy, from, to) || touches(immed, from, to) {
+                            if count {
+                                LATE_STATS[18].fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Some(WHY_READ);
                         }
-                        return Some(WHY_READ);
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
@@ -5836,7 +5888,7 @@ impl HostList {
     /// the same queue, those bytes are what the shaders wrote without the
     /// wait; title writes to them reach the copy first, through its refresh.
     pub(crate) fn card_constants(&self, shadow: &crate::shadow::Shadow, address: u64, len: u64) -> Option<u64> {
-        const SIZE: u64 = 1 << 20;
+        const SIZE: u64 = 4 << 20;
         let host = host()?;
         let offset = shadow.offset_in(address)?;
         if len == 0 || shadow.left(address) < len {

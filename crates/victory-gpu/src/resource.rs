@@ -1769,6 +1769,7 @@ pub(crate) fn let_go_idle() {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
+                crate::texture::unmark_async_uploaded(at);
                 made.take()
             } else {
                 None
@@ -2525,6 +2526,82 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         .placed
         .store(true, std::sync::atomic::Ordering::Relaxed);
     Some(out)
+}
+
+/// Creates a private `DEFAULT`-heap D3D12 texture (in `COMMON` state) for a
+/// placed title texture `desc` on a background streaming thread without
+/// registering it globally yet. Returns `(texture, mip_skip, layout, read_size)`.
+#[cfg(windows)]
+pub(crate) fn make_placed_offline(
+    desc: &[u32; 14],
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    u32,
+    victory_formats::texture::Layout,
+    usize,
+)> {
+    let key = placed_texture_key(*desc);
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { key.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER || !fills(&d) {
+        return None;
+    }
+    let layout = texture_layout(&d)?.planes[0].layout.clone();
+    if layout.desc.swizzle.xor() {
+        return None;
+    }
+    let skip = mip_skip_for(&d, true);
+    let read_size = if skip > 0
+        && layout.slices == 1
+        && skip <= layout.first_tail_mip
+        && (skip as usize) < layout.mips.len()
+    {
+        let end = layout.mips[skip as usize - 1].offset as usize;
+        if end > 0 && end <= layout.size as usize {
+            end
+        } else {
+            layout.size as usize
+        }
+    } else {
+        layout.size as usize
+    };
+    let texture = host_texture(&d, 0, std::ptr::null(), skip)?;
+    Some((texture, skip, layout, read_size))
+}
+
+/// Installs an already-uploaded `DEFAULT`-heap texture (in `COMMON` state, after
+/// its `COPY` queue fence has signaled) as the host copy of placed texture
+/// `(address, desc)`. Returns the title resource pointer (`This`) and whether
+/// our pre-uploaded texture was installed (false if another thread raced first).
+#[cfg(windows)]
+pub(crate) fn install_async_placed(
+    address: u64,
+    desc: &[u32; 14],
+    texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> Option<(This, bool)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let this = texture_at(address, desc)?;
+    let r = resource(this);
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let installed = if made.is_none() {
+        let mut host = HostTexture::new(texture, 0);
+        host.filled = true;
+        KINDS[0].fetch_add(1, Relaxed);
+        KINDS[1].fetch_add(host.bytes, Relaxed);
+        if r.host.gone.load(Relaxed) {
+            KINDS[4].fetch_add(1, Relaxed);
+            KINDS[5].fetch_add(host.bytes, Relaxed);
+        }
+        KINDS[6].fetch_add(1, Relaxed);
+        *made = Some((std::sync::Arc::new(host), None));
+        drop(made);
+        crate::descriptor::texture_made(this as usize);
+        true
+    } else {
+        false
+    };
+    r.host.used.store(crate::host::moment(), Relaxed);
+    Some((this, installed))
 }
 
 pub(crate) extern "system" fn create_placed(

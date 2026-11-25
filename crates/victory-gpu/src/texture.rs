@@ -541,8 +541,31 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
         .is_some_and(|set| set.contains(&resource))
 }
 
+/// Placed textures already uploaded by the background `COPY`-queue streamer
+/// (resource -> `(title_start, title_end)`). Cleared on remap, recheck change,
+/// eviction, or resource release.
+static ASYNC_UPLOADED: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
+
+pub(crate) fn unmark_async_uploaded(resource: usize) {
+    if let Some(map) = ASYNC_UPLOADED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&resource);
+    }
+}
+
+pub(crate) fn async_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut guard = ASYNC_UPLOADED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.retain(|_, &mut (s, e)| e <= at || s >= end);
+    }
+}
+
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
+    unmark_async_uploaded(resource);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
@@ -581,6 +604,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written || !list.first_use(resource as usize) {
+        return;
+    }
+    if ASYNC_UPLOADED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|map| map.contains_key(&(resource as usize)))
+    {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -1325,6 +1356,438 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+/// Whether new placed textures in `heap_textures` are created, detiled, and
+/// uploaded on a dedicated background `COPY` queue (`VICTORY_ASYNC_TEXTURES`,
+/// on by default outside tests; `=0` reverts to synchronous render-thread staging).
+pub(crate) fn async_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !cfg!(test)
+            && std::env::var_os("VICTORY_ASYNC_TEXTURES").is_none_or(|v| v != "0")
+    })
+}
+
+pub(crate) struct AsyncJob {
+    pub index: u32,
+    pub write: u64,
+    pub handle: u64,
+    pub address: u64,
+    pub desc: [u32; 14],
+    pub len: u64,
+}
+
+pub(crate) enum AsyncDone {
+    Unmapped {
+        index: u32,
+        write: u64,
+    },
+    Uploaded {
+        index: u32,
+        write: u64,
+        handle: u64,
+        at: u64,
+        len: u64,
+        print: u64,
+        partly: Option<u64>,
+        bytes: u64,
+    },
+    Skip {
+        index: u32,
+        write: u64,
+    },
+}
+
+struct AsyncStreamer {
+    pending: std::collections::VecDeque<AsyncJob>,
+    in_flight: std::collections::HashSet<(u32, u64)>,
+    ready: Vec<AsyncDone>,
+}
+
+static ASYNC_STATE: Mutex<Option<AsyncStreamer>> = Mutex::new(None);
+static ASYNC_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static ASYNC_STARTED: std::sync::Once = std::sync::Once::new();
+
+/// Enqueues a new placed texture for background detile + dedicated `COPY`-queue
+/// upload. Returns true if queued or already in-flight (render thread moves on
+/// immediately without stalling).
+pub(crate) fn enqueue_async_placed(job: AsyncJob) -> bool {
+    ASYNC_STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("texture-streamer".into())
+            .spawn(async_streamer_loop);
+    });
+    let mut state = ASYNC_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let s = state.get_or_insert_with(|| AsyncStreamer {
+        pending: std::collections::VecDeque::new(),
+        in_flight: std::collections::HashSet::new(),
+        ready: Vec::new(),
+    });
+    let key = (job.index, job.write);
+    if s.in_flight.contains(&key) {
+        return true;
+    }
+    // Cap queued backlog so memory stays bounded while keeping the COPY queue fed;
+    // return true so the render thread does not fall back to synchronous stalling.
+    if s.pending.len() >= 512 {
+        return true;
+    }
+    s.in_flight.insert(key);
+    s.pending.push_back(job);
+    ASYNC_WAKE.notify_one();
+    true
+}
+
+/// Drains completed background-uploaded textures for the render thread to bind SRVs.
+pub(crate) fn take_async_ready() -> Vec<AsyncDone> {
+    let mut state = ASYNC_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    match state.as_mut() {
+        Some(s) if !s.ready.is_empty() => std::mem::take(&mut s.ready),
+        _ => Vec::new(),
+    }
+}
+
+fn async_fingerprint(bytes: &[u8]) -> u64 {
+    const WINDOW: usize = 16 << 10;
+    let len = bytes.len();
+    let mut hasher = blake3::Hasher::new();
+    if len <= 3 * WINDOW {
+        hasher.update(bytes);
+    } else {
+        hasher.update(&bytes[..WINDOW]);
+        let mid = (len / 2) & !0xfff;
+        hasher.update(&bytes[mid..(mid + WINDOW).min(len)]);
+        hasher.update(&bytes[len - WINDOW..]);
+    }
+    let hash = hasher.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
+fn async_detile_into(
+    layout: &victory_formats::texture::Layout,
+    mip_skip: u32,
+    mips: u32,
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+    tiled: &[u8],
+    dst: *mut u8,
+) -> bool {
+    for (i, (footprint, &r)) in footprints.iter().zip(rows).enumerate() {
+        let (mip, slice) = (i as u32 % mips, i as u32 / mips);
+        let console_mip = mip + mip_skip;
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        let len = pitch * r as usize * f.Depth as usize;
+        let depth_pitch = pitch * r as usize;
+        if f.Depth == 1 && r >= 64 && len >= (128 << 10) {
+            let chunks = 4u32.min(r / 16);
+            let step = r.div_ceil(chunks);
+            let layout_ptr = layout as *const victory_formats::texture::Layout as usize;
+            let tiled_ptr = tiled.as_ptr() as usize;
+            let tiled_len = tiled.len();
+            let linear_ptr = unsafe { dst.add(footprint.Offset as usize) } as usize;
+            let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(chunks as usize);
+            for c in 0..chunks {
+                let y0 = c * step;
+                let y1 = ((c + 1) * step).min(r);
+                if y0 >= y1 {
+                    break;
+                }
+                let chunk_off = y0 as usize * pitch;
+                let chunk_len = (y1 - y0) as usize * pitch;
+                let chunk_ptr = linear_ptr + chunk_off;
+                let failed = failed.clone();
+                jobs.push(Box::new(move || {
+                    let layout = unsafe { &*(layout_ptr as *const victory_formats::texture::Layout) };
+                    let tiled = unsafe { std::slice::from_raw_parts(tiled_ptr as *const u8, tiled_len) };
+                    let linear = unsafe { std::slice::from_raw_parts_mut(chunk_ptr as *mut u8, chunk_len) };
+                    if layout.detile_rows(tiled, console_mip, slice, linear, pitch, depth_pitch, y0, y1).is_err() {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }));
+            }
+            crate::shadow::wide_run(jobs);
+            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            continue;
+        }
+        // SAFETY: disjoint subresource slice in our privately owned upload buffer.
+        let linear = unsafe { std::slice::from_raw_parts_mut(dst.add(footprint.Offset as usize), len) };
+        if layout.detile(tiled, console_mip, slice, linear, pitch, depth_pitch).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+fn async_streamer_loop() {
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+    let Some(host) = host() else {
+        return;
+    };
+    let (copy_queue, copy_alloc, copy_cmd, fence, event) = unsafe {
+        let Ok(q): Result<ID3D12CommandQueue, _> = host.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_COPY,
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let Ok(a): Result<ID3D12CommandAllocator, _> =
+            host.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)
+        else {
+            return;
+        };
+        let Ok(cmd): Result<ID3D12GraphicsCommandList, _> =
+            host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &a, None)
+        else {
+            return;
+        };
+        let _ = cmd.Close();
+        let Ok(f): Result<ID3D12Fence, _> = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) else {
+            return;
+        };
+        let Ok(ev) = CreateEventW(None, false, false, None) else {
+            return;
+        };
+        (q, a, cmd, f, ev)
+    };
+    let mut fence_val = 0u64;
+    let mut read_buf: Vec<u8> = Vec::new();
+    tracing::info!("async background COPY-queue texture streamer started");
+    loop {
+        let jobs: Vec<AsyncJob> = {
+            let mut state = ASYNC_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                let empty = state.as_ref().is_none_or(|s| s.pending.is_empty());
+                if !empty {
+                    break;
+                }
+                state = ASYNC_WAKE.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            let s = state.as_mut().unwrap();
+            let take = s.pending.len().min(24);
+            (0..take).filter_map(|_| s.pending.pop_front()).collect()
+        };
+        if jobs.is_empty() {
+            continue;
+        }
+        let mut done_now: Vec<AsyncDone> = Vec::new();
+        let mut batch: Vec<(AsyncJob, ID3D12Resource, ID3D12Resource, u64, u64, Option<u64>, usize)> =
+            Vec::new();
+        let mut batch_bytes = 0u64;
+        let mut cmd_open = false;
+        let mut flush_batch = |batch: &mut Vec<(AsyncJob, ID3D12Resource, ID3D12Resource, u64, u64, Option<u64>, usize)>,
+                               cmd_open: &mut bool,
+                               done_now: &mut Vec<AsyncDone>| {
+            if !*cmd_open || batch.is_empty() {
+                if *cmd_open {
+                    unsafe {
+                        let _ = copy_cmd.Close();
+                    }
+                    *cmd_open = false;
+                }
+                batch.clear();
+                return;
+            }
+            fence_val += 1;
+            let ok = unsafe {
+                copy_cmd.Close().is_ok() && {
+                    let list: ID3D12CommandList = copy_cmd.cast().unwrap();
+                    copy_queue.ExecuteCommandLists(&[Some(list)]);
+                    copy_queue.Signal(&fence, fence_val).is_ok()
+                        && fence.SetEventOnCompletion(fence_val, event).is_ok()
+                }
+            };
+            *cmd_open = false;
+            if ok {
+                unsafe { WaitForSingleObject(event, INFINITE) };
+                for (job, gpu_tex, _upload_buf, total, print, partly, read_size) in batch.drain(..) {
+                    if let Some((this, installed)) =
+                        crate::resource::install_async_placed(job.address, &job.desc, gpu_tex)
+                    {
+                        if installed {
+                            ASYNC_UPLOADED
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_insert_with(HashMap::new)
+                                .insert(
+                                    this as usize,
+                                    (job.address as usize, (job.address as usize).saturating_add(read_size)),
+                                );
+                        }
+                        done_now.push(AsyncDone::Uploaded {
+                            index: job.index,
+                            write: job.write,
+                            handle: job.handle,
+                            at: job.address,
+                            len: job.len,
+                            print,
+                            partly,
+                            bytes: total,
+                        });
+                    } else {
+                        done_now.push(AsyncDone::Skip {
+                            index: job.index,
+                            write: job.write,
+                        });
+                    }
+                }
+            } else {
+                for (job, ..) in batch.drain(..) {
+                    done_now.push(AsyncDone::Skip {
+                        index: job.index,
+                        write: job.write,
+                    });
+                }
+            }
+        };
+
+        for job in jobs {
+            if crate::resource::placed_has_host_copy(job.address, &job.desc) || !crate::resource::room() {
+                done_now.push(AsyncDone::Skip {
+                    index: job.index,
+                    write: job.write,
+                });
+                continue;
+            }
+            let mapped = mapped_bytes(job.address as *const u8, job.len as usize);
+            if mapped == 0 {
+                done_now.push(AsyncDone::Unmapped {
+                    index: job.index,
+                    write: job.write,
+                });
+                continue;
+            }
+            let partly = (mapped < job.len).then_some(mapped);
+            let Some((gpu_tex, mip_skip, layout, read_size)) =
+                crate::resource::make_placed_offline(&job.desc)
+            else {
+                done_now.push(AsyncDone::Skip {
+                    index: job.index,
+                    write: job.write,
+                });
+                continue;
+            };
+            let d = unsafe { gpu_tex.GetDesc() };
+            let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                u32::from(d.MipLevels)
+            } else {
+                u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
+            };
+            let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+            let mut rows = vec![0u32; count as usize];
+            let mut total = 0u64;
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &d,
+                    0,
+                    count,
+                    0,
+                    Some(footprints.as_mut_ptr()),
+                    Some(rows.as_mut_ptr()),
+                    None,
+                    Some(&mut total),
+                );
+            }
+            let Some((upload_buf, upload_ptr)) = host.upload_buffer(total) else {
+                done_now.push(AsyncDone::Skip {
+                    index: job.index,
+                    write: job.write,
+                });
+                continue;
+            };
+            let full_size = layout.size as usize;
+            if read_buf.len() < full_size {
+                read_buf.resize(full_size, 0);
+            }
+            // Read title memory without ever blocking on remaps: try in-place read lock,
+            // fall back to sparse copy_mapped.
+            let mut print = 1u64;
+            let detiled = if partly.is_none()
+                && let Some(_reading) = crate::watch::title_memory_reading_now()
+                && committed(job.address as *const u8, read_size)
+            {
+                // SAFETY: `reading` prevents unmapping while committed pages are read.
+                let src = unsafe { std::slice::from_raw_parts(job.address as *const u8, read_size) };
+                print = async_fingerprint(src);
+                if read_size == full_size {
+                    async_detile_into(&layout, mip_skip, u32::from(d.MipLevels), &footprints, &rows, src, upload_ptr)
+                } else {
+                    read_buf[..read_size].copy_from_slice(src);
+                    async_detile_into(&layout, mip_skip, u32::from(d.MipLevels), &footprints, &rows, &read_buf[..full_size], upload_ptr)
+                }
+            } else {
+                read_buf[..read_size].fill(0);
+                crate::host::copy_mapped(read_buf.as_mut_ptr(), job.address as *const u8, read_size, false);
+                print = async_fingerprint(&read_buf[..read_size]);
+                async_detile_into(&layout, mip_skip, u32::from(d.MipLevels), &footprints, &rows, &read_buf[..full_size], upload_ptr)
+            };
+            if !detiled {
+                done_now.push(AsyncDone::Skip {
+                    index: job.index,
+                    write: job.write,
+                });
+                continue;
+            }
+            if !cmd_open {
+                let opened = unsafe { copy_alloc.Reset().and_then(|()| copy_cmd.Reset(&copy_alloc, None)) };
+                if opened.is_err() {
+                    done_now.push(AsyncDone::Skip {
+                        index: job.index,
+                        write: job.write,
+                    });
+                    continue;
+                }
+                cmd_open = true;
+            }
+            for (i, footprint) in footprints.iter().enumerate() {
+                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: unsafe { std::mem::transmute_copy(&gpu_tex) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: i as u32,
+                    },
+                };
+                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: unsafe { std::mem::transmute_copy(&upload_buf) },
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: *footprint,
+                    },
+                };
+                unsafe {
+                    copy_cmd.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                }
+            }
+            batch_bytes += total;
+            batch.push((job, gpu_tex, upload_buf, total, print, partly, read_size));
+            if batch_bytes >= (32 << 20) {
+                flush_batch(&mut batch, &mut cmd_open, &mut done_now);
+                batch_bytes = 0;
+            }
+        }
+        flush_batch(&mut batch, &mut cmd_open, &mut done_now);
+        if !done_now.is_empty() {
+            let mut state = ASYNC_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = state.as_mut() {
+                for d in &done_now {
+                    let key = match *d {
+                        AsyncDone::Unmapped { index, write }
+                        | AsyncDone::Uploaded { index, write, .. }
+                        | AsyncDone::Skip { index, write } => (index, write),
+                    };
+                    s.in_flight.remove(&key);
+                }
+                s.ready.extend(done_now);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
