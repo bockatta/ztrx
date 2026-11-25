@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -5903,40 +5903,6 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
-            {
-                let making = crate::pipeline::making();
-                let ready = crate::pipeline::library::LOADED.load(Ordering::Relaxed)
-                    + crate::pipeline::library::MADE.load(Ordering::Relaxed);
-                let total_sh = ready + making;
-                let sh_pct = if total_sh > 0 {
-                    (ready * 100) / total_sh
-                } else {
-                    100
-                };
-                let tex_up = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed);
-                let tex_wait = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
-                let tex_tot = tex_up + tex_wait;
-                let tex_pct = if tex_tot > 0 {
-                    (tex_up * 100) / tex_tot
-                } else {
-                    100
-                };
-                let vram = host()
-                    .and_then(|h| h.video_memory())
-                    .map(|[budget, used, ..]| {
-                        format!(
-                            "VRAM: {:.1}/{:.1}GB",
-                            used as f64 / 1073741824.0,
-                            budget as f64 / 1073741824.0
-                        )
-                    })
-                    .unwrap_or_else(|| "VRAM: n/a".into());
-                let state = if draws < 50.0 { "Loading" } else { "In-World" };
-                let title = format!(
-                    "ALquerez ({state}) | {fps:.1} FPS ({ms:.0}ms) | Shaders: {sh_pct}% ({ready}/{total_sh}) | Load: {tex_pct}% | {vram} | Draws: {draws:.0} (drop {dropped:.0}) | Heap: {picked_ms:.0}ms | [A]=Enter/Space [Look]=Mouse(F8)"
-                );
-                update_window_title(&title);
-            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -5956,9 +5922,31 @@ impl Meter {
             buffer.truncate(n.max(0) as usize);
             self.caption = Some(buffer);
         }
-        let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        let Some(_caption) = &self.caption else { return };
+        let making = crate::pipeline::making();
+        let ready = crate::pipeline::library::LOADED.load(Ordering::Relaxed)
+            + crate::pipeline::library::MADE.load(Ordering::Relaxed);
+        let total_sh = ready + making;
+        let sh_pct = if total_sh > 0 { (ready * 100) / total_sh } else { 100 };
+        let tex_up = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed);
+        let tex_wait = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed);
+        let tex_tot = tex_up + tex_wait;
+        let tex_pct = if tex_tot > 0 { (tex_up * 100) / tex_tot } else { 100 };
+        let vram = host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, used, ..]| {
+                format!(
+                    "VRAM {:.1}/{:.1}GB",
+                    used as f64 / 1073741824.0,
+                    budget as f64 / 1073741824.0
+                )
+            })
+            .unwrap_or_else(|| "VRAM n/a".into());
+        let phase = if draws < 50.0 { "Loading" } else { "In-World" };
+        let text = format!(
+            "ALquerez ({phase}) | {fps:.1} fps ({ms:.0}ms) | Shaders {sh_pct}% ({ready}/{total_sh}) | Load {tex_pct}% | {vram} | {draws:.0} draws (drop {dropped:.0}) | Heap {picked_ms:.0}ms | [A]=Enter/Space [Look]=Mouse(F8)"
+        );
+        let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
@@ -6423,20 +6411,6 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
-static MAIN_HWND: AtomicUsize = AtomicUsize::new(0);
-
-fn update_window_title(title: &str) {
-    let raw = MAIN_HWND.load(Ordering::Relaxed);
-    if raw == 0 {
-        return;
-    }
-    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: valid NUL-terminated UTF-16 string and window handle owned by this process.
-    unsafe {
-        let _ = SetWindowTextW(HWND(raw as *mut _), PCWSTR(wide.as_ptr()));
-    }
-}
-
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -6468,7 +6442,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
-        let hwnd = CreateWindowExW(
+        CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("ALquerez | Starting... | [A]=Enter/Space  [B]=Back/R  [LT]=RMB  [RT]=LMB  [Move]=WASD  [Look]=Mouse(F8)/IJKL"),
@@ -6481,9 +6455,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )?;
-        MAIN_HWND.store(hwnd.0 as usize, Ordering::Relaxed);
-        Ok(hwnd)
+        )
     }
 }
 
