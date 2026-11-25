@@ -93,6 +93,8 @@ mod own_bits;
 mod per_program;
 mod rect;
 mod sampler;
+#[cfg(test)]
+mod sampler_choice_tests;
 mod shader;
 mod threading;
 #[cfg(windows)]
