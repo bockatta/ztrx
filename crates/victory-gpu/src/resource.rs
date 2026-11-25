@@ -1483,10 +1483,11 @@ pub(crate) fn room() -> bool {
         Some([budget, used, ..]) if !spill => used < budget / 100 * room_percent(),
         Some([budget, used, shared_budget, shared_used]) => {
             let own = budget / 100 * room_percent();
-            // Cap shared-RAM spill to at most 4 GiB (or 1/3 of shared budget):
-            // enough headroom so all nearby mesh/character textures upload without
-            // turning pitch black, without overcommitting 16+ GB into WDDM paging.
-            let spill_cap = (shared_budget / 3).min(4 << 30);
+            // Allow up to half the shared GPU budget (capped at 8 GiB) so 32 GB
+            // RAM systems don't trip `room() == false` (which shuts off async
+            // texture streaming and leaves prison floor/wall textures unloaded)
+            // when ~4-5 GiB of shared memory is held by title buffer windows.
+            let spill_cap = (shared_budget / 2).min(8 << 30);
             used < own || used + shared_used < own + spill_cap
         }
         None => filled < WITHOUT_BUDGET,

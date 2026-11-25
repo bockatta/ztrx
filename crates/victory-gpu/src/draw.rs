@@ -1858,11 +1858,48 @@ impl State {
         }
         let use_async = crate::texture::async_textures() && PASS_BUDGET.get().is_none() && room;
         let mut processed = 0usize;
+        let mut async_queued = 0usize;
+        let mut sync_budget_hit = false;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            // Keep feeding fresh placed textures into the background COPY queue
+            // (up to 1024/frame, < 0.5 ms on render thread) even after the sync
+            // budget is reached so the async streamer never starves at 0 pending.
+            if sync_budget_hit && (!use_async || async_queued >= 1024) {
                 break;
             }
+            if !sync_budget_hit && (SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span) {
+                sync_budget_hit = true;
+                if !use_async || async_queued >= 1024 {
+                    break;
+                }
+            }
             processed += 1;
+            if sync_budget_hit {
+                // Fast async-only tail pass: only enqueue brand-new placed textures.
+                let handle = heap.handle(index);
+                let view = handle.and_then(crate::descriptor::view);
+                if let Some(h) = handle
+                    && let Some(View::Placed(false, resource_desc, desc)) = &view
+                    && host.texture_slot_checked(index).is_none()
+                    && host.texture_slot_mapped(index) == 0
+                {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    if !crate::resource::placed_has_host_copy(address, resource_desc) {
+                        let len = crate::resource::placed_needed_bytes(resource_desc).unwrap_or(1);
+                        if crate::texture::enqueue_async_placed(crate::texture::AsyncJob {
+                            index,
+                            write,
+                            handle: h,
+                            address,
+                            desc: *resource_desc,
+                            len,
+                        }) {
+                            async_queued += 1;
+                        }
+                    }
+                }
+                continue;
+            }
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -1933,6 +1970,7 @@ impl State {
                         desc: *resource_desc,
                         len,
                     }) {
+                        async_queued += 1;
                         continue;
                     }
                 }
@@ -2089,6 +2127,54 @@ impl State {
                     host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
+            }
+        }
+        // Initial scene-load drain gate (`VICTORY_LOAD_DRAIN=1`, default on):
+        // when entering a scene with a massive backlog (>= 1024 due slots),
+        // briefly wait for the background COPY-queue batch to land and bind its
+        // completed SRVs before presenting so the player doesn't spawn into an
+        // untextured prison. Bounded to the first 24 burst passes (0 ms in play).
+        static LOAD_DRAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static DRAIN_PASSES: AtomicU64 = AtomicU64::new(0);
+        if use_async
+            && async_queued > 0
+            && census[1] >= 1024
+            && *LOAD_DRAIN.get_or_init(|| std::env::var_os("VICTORY_LOAD_DRAIN").is_none_or(|v| v != "0"))
+            && DRAIN_PASSES.fetch_add(1, Ordering::Relaxed) < 24
+        {
+            crate::texture::async_drain_wait(150);
+            for done in crate::texture::take_async_ready() {
+                match done {
+                    crate::texture::AsyncDone::Unmapped { index, write } => {
+                        HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_gone(index);
+                        host.texture_slot_later(index, write, frame, most);
+                    }
+                    crate::texture::AsyncDone::Uploaded {
+                        index,
+                        write,
+                        handle,
+                        at,
+                        len,
+                        print,
+                        partly,
+                        bytes,
+                    } => {
+                        let _ = host.mirror(index, handle, true);
+                        let again = partly.map(|mapped| (frame + 1, mapped));
+                        if again.is_some() {
+                            HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                        HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                        HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+                        if again.is_none() && heap_recheck() {
+                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                        } else {
+                            host.texture_slot_done(index, write, again);
+                        }
+                    }
+                    crate::texture::AsyncDone::Skip { .. } => {}
+                }
             }
         }
     }

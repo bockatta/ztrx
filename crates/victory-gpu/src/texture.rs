@@ -1438,9 +1438,9 @@ pub(crate) fn enqueue_async_placed(job: AsyncJob) -> bool {
     if s.in_flight.contains(&key) {
         return true;
     }
-    // Cap queued backlog so memory stays bounded while keeping the COPY queue fed;
-    // return true so the render thread does not fall back to synchronous stalling.
-    if s.pending.len() >= 512 {
+    // Cap queued backlog so memory stays bounded while keeping the COPY queue
+    // continuously saturated during scene load bursts (2048 slots ~= ~400 MB).
+    if s.pending.len() >= 2048 {
         return true;
     }
     s.in_flight.insert(key);
@@ -1448,6 +1448,25 @@ pub(crate) fn enqueue_async_placed(job: AsyncJob) -> bool {
     ASYNC_PENDING_COUNT.store(s.pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
     ASYNC_WAKE.notify_one();
     true
+}
+
+/// Waits up to `max_ms` during initial scene load bursts for the background
+/// `COPY`-queue streamer to publish newly uploaded textures into `ready`.
+pub(crate) fn async_drain_wait(max_ms: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
+    while std::time::Instant::now() < deadline {
+        let done = {
+            let state = ASYNC_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            match state.as_ref() {
+                None => true,
+                Some(s) => !s.ready.is_empty() || (s.pending.is_empty() && s.in_flight.is_empty()),
+            }
+        };
+        if done {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// Drains completed background-uploaded textures for the render thread to bind SRVs.
@@ -1582,7 +1601,7 @@ fn async_streamer_loop() {
                 state = ASYNC_WAKE.wait(state).unwrap_or_else(|e| e.into_inner());
             }
             let s = state.as_mut().unwrap();
-            let take = s.pending.len().min(24);
+            let take = s.pending.len().min(64);
             let taken: Vec<AsyncJob> = (0..take).filter_map(|_| s.pending.pop_front()).collect();
             ASYNC_PENDING_COUNT.store(s.pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
             taken
@@ -1781,7 +1800,7 @@ fn async_streamer_loop() {
             }
             batch_bytes += total;
             batch.push((job, gpu_tex, upload_buf, total, print, partly, read_size));
-            if batch_bytes >= (32 << 20) {
+            if batch_bytes >= (64 << 20) {
                 flush_batch(&mut batch, &mut cmd_open, &mut done_now);
                 batch_bytes = 0;
             }
