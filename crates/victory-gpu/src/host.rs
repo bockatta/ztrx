@@ -2440,11 +2440,15 @@ pub(crate) fn note_gpu_written_cbv_page(src: usize, len: usize) {
     if len == 0 {
         return;
     }
-    let first = src >> 16;
-    let last = src.saturating_add(len).saturating_sub(1) >> 16;
+    // Learn at 1 MiB chunk granularity (`>> 20`) up to 1024 chunks (1 GiB):
+    // GTA VI's 480-byte constant ring buffer spans 32+ MiB (`0x77c..0x8b5`),
+    // which previously overflowed the 128 x 64 KiB (8 MiB) cap and kept
+    // settling 0.5-0.8x/frame (~40 ms/frame).
+    let first = src >> 20;
+    let last = src.saturating_add(len).saturating_sub(1) >> 20;
     let mut set = GPU_WRITTEN_CBV_PAGES.write().unwrap_or_else(|e| e.into_inner());
     let set = set.get_or_insert_with(std::collections::HashSet::new);
-    if set.len() >= 128 {
+    if set.len() >= 1024 {
         return;
     }
     let before = set.len();
@@ -2460,8 +2464,8 @@ pub(crate) fn is_gpu_written_cbv_page(address: u64, len: u64) -> bool {
     if len == 0 || GPU_WRITTEN_CBV_COUNT.load(Ordering::Relaxed) == 0 {
         return false;
     }
-    let first = (address as usize) >> 16;
-    let last = (address.saturating_add(len).saturating_sub(1) as usize) >> 16;
+    let first = (address as usize) >> 20;
+    let last = (address.saturating_add(len).saturating_sub(1) as usize) >> 20;
     let set = GPU_WRITTEN_CBV_PAGES.read().unwrap_or_else(|e| e.into_inner());
     let Some(set) = set.as_ref() else {
         return false;
@@ -6355,6 +6359,15 @@ impl HostList {
 /// spread over the threads kept for the snapshots (`crate::shadow::wide`).
 /// The write-watch journal and the guards are behind their own locks, as
 /// they are for the title's threads.
+/// Whether `Batch::flush` resolves dirty page ranges on the submitting thread
+/// (zero `watch::JOURNAL` lock contention) and executes the raw byte copies in
+/// coarse parallel chunks across `shadow::wide_run` (`VICTORY_PARALLEL_COPY=0`
+/// reverts to single-threaded copies).
+fn parallel_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_COPY").is_none_or(|v| v != "0"))
+}
+
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
@@ -6464,6 +6477,69 @@ impl Batch {
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        } else if parallel_copy() && !self.refreshes.is_empty() {
+            let started = std::time::Instant::now();
+            let mut copies: Vec<crate::shadow::CopyOp> = Vec::new();
+            let mut marks: Vec<crate::shadow::MarkOp> = Vec::new();
+            let mut total_bytes = 0usize;
+            for (shadow, from, to) in self.refreshes.drain(..) {
+                total_bytes += shadow.collect_update(from, to - from, &mut copies, &mut marks);
+            }
+            if total_bytes >= (256 << 10) && !copies.is_empty() {
+                // Partition copies (splitting large >1 MiB spans) into coarse
+                // lock-free chunks (~6 chunks) so all CPU cores copy in parallel
+                // with zero `watch::JOURNAL` or `Shadow` mutex contention.
+                const SLICE: usize = 1 << 20;
+                const TARGET_CHUNKS: usize = 6;
+                let chunk_bytes = (total_bytes / TARGET_CHUNKS).max(256 << 10);
+                let mut chunks: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(TARGET_CHUNKS + 2);
+                let mut cur: Vec<(usize, usize, usize)> = Vec::new();
+                let mut cur_bytes = 0usize;
+                for op in copies {
+                    let mut off = 0usize;
+                    while off < op.len {
+                        let n = SLICE.min(op.len - off);
+                        cur.push((op.dst + off, op.src + off, n));
+                        cur_bytes += n;
+                        off += n;
+                        if cur_bytes >= chunk_bytes {
+                            chunks.push(std::mem::take(&mut cur));
+                            cur_bytes = 0;
+                        }
+                    }
+                }
+                if !cur.is_empty() {
+                    chunks.push(cur);
+                }
+                if chunks.len() >= 2 {
+                    let jobs: Vec<Box<dyn FnOnce() + Send>> = chunks
+                        .into_iter()
+                        .map(|group| {
+                            Box::new(move || {
+                                for (dst, src, len) in group {
+                                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                                }
+                            }) as Box<dyn FnOnce() + Send>
+                        })
+                        .collect();
+                    crate::shadow::wide_run(jobs);
+                } else {
+                    for group in chunks {
+                        for (dst, src, len) in group {
+                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        }
+                    }
+                }
+            } else {
+                for op in copies {
+                    copy_mapped(op.dst as *mut u8, op.src as *const u8, op.len, false);
+                }
+            }
+            for m in marks {
+                m.shadow.finish_mark(m.from_off, m.to_off);
+            }
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PREPARING[1].fetch_add(total_bytes as u64, Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);

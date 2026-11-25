@@ -1007,7 +1007,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).max(2)).clamp(2, 8);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -2545,6 +2545,168 @@ impl Shadow {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
         bytes
+    }
+}
+
+/// One lock-free title->shadow byte copy scheduled by [`Shadow::collect_update`].
+pub(crate) struct CopyOp {
+    pub(crate) dst: usize,
+    pub(crate) src: usize,
+    pub(crate) len: usize,
+}
+
+/// Post-copy dirty notification paired with [`CopyOp`], keeping the `Shadow`
+/// alive for the full duration of parallel copy execution.
+pub(crate) struct MarkOp {
+    pub(crate) shadow: Arc<Shadow>,
+    pub(crate) from_off: usize,
+    pub(crate) to_off: usize,
+}
+
+impl Shadow {
+    /// Resolves stale byte ranges of `[address, address + len)` on the calling
+    /// thread (single-threaded `watch::writes` with zero lock contention) and
+    /// appends pure byte copies to `copies` and post-copy notifications to
+    /// `marks`. Call [`Shadow::finish_mark`] for each `MarkOp` after all
+    /// `CopyOp`s have executed.
+    pub(crate) fn collect_update(
+        self: &Arc<Self>,
+        address: usize,
+        len: usize,
+        copies: &mut Vec<CopyOp>,
+        marks: &mut Vec<MarkOp>,
+    ) -> usize {
+        if self.place.is_some() {
+            return 0;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return 0;
+        }
+        let mut busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .filter(|&(a, e)| a < to && e > from)
+            .collect();
+        if !busy.is_empty() {
+            busy.sort_unstable();
+            let (mut at, mut bytes) = (from, 0);
+            for (a, e) in busy {
+                if a > at {
+                    bytes += self.collect_free(at, a, copies, marks);
+                }
+                at = at.max(e);
+            }
+            if at < to {
+                bytes += self.collect_free(at, to, copies, marks);
+            }
+            return bytes;
+        }
+        self.collect_free(from, to, copies, marks)
+    }
+
+    fn collect_free(
+        self: &Arc<Self>,
+        from: usize,
+        to: usize,
+        copies: &mut Vec<CopyOp>,
+        marks: &mut Vec<MarkOp>,
+    ) -> usize {
+        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+                self.watched.store(1, Ordering::Relaxed);
+                let copied = self.collect_stale(from, to, now, &written, copies, marks);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                }
+                return copied;
+            }
+            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        self.push_copy(from, to, copies, marks)
+    }
+
+    fn collect_stale(
+        self: &Arc<Self>,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        copies: &mut Vec<CopyOp>,
+        marks: &mut Vec<MarkOp>,
+    ) -> usize {
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writes = written.iter().peekable();
+        let (mut bytes, mut run) = (0, None);
+        let last = (to - 1) / PAGE;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        for page in from / PAGE..=last {
+            let write = match writes.peek() {
+                Some(&&(p, w)) if p == page => {
+                    writes.next();
+                    w
+                }
+                _ => 0,
+            };
+            let at = &mut copied[page - base];
+            if *at == 0 || write > *at {
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+                run.get_or_insert(page);
+            } else if let Some(first) = run.take() {
+                bytes += self.push_copy((first * PAGE).max(from), (page * PAGE).min(to), copies, marks);
+            }
+        }
+        if let Some(first) = run {
+            bytes += self.push_copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to), copies, marks);
+        }
+        bytes
+    }
+
+    fn push_copy(
+        self: &Arc<Self>,
+        from: usize,
+        to: usize,
+        copies: &mut Vec<CopyOp>,
+        marks: &mut Vec<MarkOp>,
+    ) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        if copy_compare() && !self.carded() && !self.upload.load(Ordering::Relaxed) {
+            return self.copy_compared(from, to);
+        }
+        let dst = unsafe { self.data.add(from - start) } as usize;
+        copies.push(CopyOp {
+            dst,
+            src: from,
+            len: to - from,
+        });
+        marks.push(MarkOp {
+            shadow: self.clone(),
+            from_off: from - start,
+            to_off: to - start,
+        });
+        to - from
+    }
+
+    /// Marks `[from_off, to_off)` changed after its parallel [`CopyOp`] finishes.
+    pub(crate) fn finish_mark(&self, from_off: usize, to_off: usize) {
+        self.changed(from_off, to_off);
+        self.card_changed(from_off, to_off);
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
