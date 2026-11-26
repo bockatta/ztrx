@@ -1727,23 +1727,57 @@ impl HostHeap {
         let n = n as usize;
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
+        // Word-wide scan over 0/1 flags (zero crate dependency, LLVM vectorizes).
+        #[inline]
+        fn find_zero(s: &[u8]) -> Option<usize> {
+            const ALL_ONE: u64 = 0x0101_0101_0101_0101;
+            let mut i = 0;
+            let chunks = s.len() & !7;
+            while i < chunks {
+                let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+                if w != ALL_ONE {
+                    return Some(i + ((w ^ ALL_ONE).trailing_zeros() as usize / 8));
+                }
+                i += 8;
             }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
+            s[i..].iter().position(|&b| b == 0).map(|p| i + p)
+        }
+        #[inline]
+        fn find_one(s: &[u8]) -> Option<usize> {
+            let mut i = 0;
+            let chunks = s.len() & !7;
+            while i < chunks {
+                let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+                if w != 0 {
+                    return Some(i + (w.trailing_zeros() as usize / 8));
+                }
+                i += 8;
+            }
+            s[i..].iter().position(|&b| b != 0).map(|p| i + p)
+        }
+        // SAFETY: `bool` has the size and alignment of `u8` and holds 0 or 1.
+        let flags: &[u8] = unsafe { std::slice::from_raw_parts(taken.as_ptr().cast::<u8>(), taken.len()) };
+        let end = (self.dynamic as usize).min(flags.len());
+        let start = (*next as usize).min(end);
+        let second_end = start.saturating_add(n.saturating_sub(1)).min(end);
+        let mut found = None;
+        if enough {
+            'search: for (from, to) in [(start, end), (0, second_end)] {
+                let mut at = from;
+                while at + n <= to {
+                    let Some(free) = find_zero(&flags[at..to]) else { break };
+                    let first = at + free;
+                    if first + n > to {
+                        break;
+                    }
+                    match find_one(&flags[first..first + n]) {
+                        None => {
+                            found = Some(first);
+                            break 'search;
+                        }
+                        Some(hit) => at = first + hit + 1,
+                    }
+                }
             }
         }
         let Some(first) = found else {
@@ -1906,15 +1940,16 @@ impl HostHeap {
     }
 
     /// Right before a one-time character decoration bake (`PS_BakeDecorations_*`),
-    /// pull recently-uploaded slots awaiting their first fingerprint recheck
-    /// (`looks <= 1`) and partially-mapped slots (`mapped > 0`) to `due = frame`
-    /// so any skin/hair texture whose bytes landed after its initial zeroed
-    /// upload is re-checked and uploaded before the bake runs.
+    /// pull ALL uploaded slots awaiting a fingerprint recheck (`w.checked.2 != 0`,
+    /// not just `looks <= 1` — alias-written character face/arm textures often land
+    /// 20-80 frames after upload at `looks == 2`) and partially-mapped slots
+    /// (`mapped > 0`) to `due = frame` so stale/other-texture bytes are never
+    /// permanently baked onto character faces or arms.
     pub(crate) fn texture_slots_bake_prepare(&self, frame: u64) -> usize {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         let mut pulled = 0usize;
         for w in textures.slots.values_mut() {
-            if w.due > frame && ((w.checked.2 != 0 && w.checked.3 <= 1) || w.mapped > 0) {
+            if w.due > frame && (w.checked.2 != 0 || w.mapped > 0) {
                 w.due = frame;
                 pulled += 1;
             }
@@ -2534,6 +2569,13 @@ impl HostHeap {
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
+        self.note_buffer_marking(index, view, seen, true)
+    }
+
+    /// As [`Self::note_buffer`]; `mark`: marks the slot for the next heap buffer
+    /// pass (`false` when called from the heap buffer pass itself, avoiding
+    /// re-scanning half the heap every frame; after fxceless/victory-fork#1043).
+    fn note_buffer_marking(&self, index: u32, view: Option<&View>, seen: bool, mark: bool) -> Vec<(u32, u64)> {
         if self.sampler {
             return Vec::new();
         }
@@ -2640,7 +2682,7 @@ impl HostHeap {
         } else {
             self.buffers.remove(index)
         };
-        if was {
+        if was && mark {
             self.changed.put(index);
         }
         stale
@@ -2736,6 +2778,36 @@ impl HostHeap {
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    }
+
+    /// `VICTORY_TEXTURE_EVICT`: the slots that view one of the host textures
+    /// in `textures` (by their COM pointers) are made null views and let the
+    /// texture go (retired: a running submission may still read it). Returns
+    /// each such slot and the texture it viewed, so that the caller notes the
+    /// slot as waiting for that texture's next host copy.
+    pub(crate) fn drop_views_of(&self, textures: &std::collections::HashSet<usize>) -> Vec<(u32, usize)> {
+        if self.sampler || textures.is_empty() {
+            return Vec::new();
+        }
+        let mut dropped = Vec::new();
+        for (index, mutex) in self.kept.iter().enumerate() {
+            let mut slot = mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(raw) = slot.as_ref().map(|r| windows::core::Interface::as_raw(r) as usize) else {
+                continue;
+            };
+            if !textures.contains(&raw) {
+                continue;
+            }
+            let index = index as u32;
+            null_view(self.at(index));
+            self.put(index);
+            self.clear_twin(index);
+            if let Some(old) = slot.take() {
+                crate::host::retire(old);
+            }
+            dropped.push((index, raw));
+        }
+        dropped
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -3081,6 +3153,16 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_marking(index, handle, for_draw, true)
+    }
+
+    /// As [`Self::mirror`] for a draw, without re-marking the slot for the next
+    /// heap buffer pass (called by `heap_buffer_pass` itself).
+    pub(crate) fn mirror_unmarked(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_marking(index, handle, true, false)
+    }
+
+    fn mirror_marking(&self, index: u32, handle: u64, for_draw: bool, mark: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3132,7 +3214,7 @@ impl HostHeap {
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             // (When this slot's lock is let go: a lock at a time.)
-            let stale = self.note_buffer(index, Some(&view), for_draw);
+            let stale = self.note_buffer_marking(index, Some(&view), for_draw, mark);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -4577,6 +4659,55 @@ impl Copied<'_> {
         // SAFETY: within the records held; the caller's slots alone.
         let last = unsafe { std::slice::from_raw_parts_mut(self.at.add(at), end - at) };
         changed_records(last, &records[..end - at], self.step, first, out);
+    }
+
+    /// As [`Copied::changes`] for the `count` records of title memory at
+    /// `title` (slot `first` on), 32 bytes each, read where they are, each
+    /// once ([`crate::safecopy::changed`]); `bits` is room. False when a page
+    /// of them could not be read: those before it are done, the others
+    /// stay as last seen.
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]; `title` is title memory (read by a copy that
+    /// fails where a page is not there).
+    pub(crate) unsafe fn changes_in_place(
+        &self,
+        first: u32,
+        title: *const u8,
+        count: usize,
+        bits: &mut Vec<u64>,
+        out: &mut Vec<u32>,
+    ) -> bool {
+        let at = first as usize * self.step;
+        let count = count.min(self.len.saturating_sub(at) / 32);
+        if self.step != 32 || count == 0 {
+            return true;
+        }
+        bits.clear();
+        bits.resize(count.div_ceil(64), 0);
+        // SAFETY: within the records held; the caller's slots alone.
+        let whole = unsafe { crate::safecopy::changed(title, self.at.add(at), count, bits) };
+        for (n, &word) in bits.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                out.push(first + (n * 64) as u32 + word.trailing_zeros());
+                word &= word - 1;
+            }
+        }
+        whole
+    }
+
+    /// The `count` records last seen from slot `first` on (fewer where the
+    /// heap ends).
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]: no other call beside this one has any of
+    /// these slots.
+    pub(crate) unsafe fn seen(&self, first: u32, count: usize) -> &[u8] {
+        let at = (first as usize * self.step).min(self.len);
+        let len = (count * self.step).min(self.len - at);
+        // SAFETY: within the records held; the caller's slots alone.
+        unsafe { std::slice::from_raw_parts(self.at.add(at), len) }
     }
 }
 

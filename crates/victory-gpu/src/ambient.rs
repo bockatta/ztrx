@@ -364,10 +364,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float ao_tight = saturate(1.0 - strength * 1.75 * sum_tight);
         float ao_wide  = nw > 0 ? saturate(1.0 - strength * 1.65 * sum_wide) : ao_tight;
         float dist_fade = saturate(1.0 - (c.z - 220.0) / 130.0);
-        // Protect downward-facing indoor ceilings from harsh AO corner crush.
-        float ao_floor = n.y < -0.55 ? 0.34 : 0.11;
+        // Protect characters, interiors, and downward-facing ceilings from dark AO crush.
+        float ao_floor = n.y < -0.55 ? 0.54 : 0.32;
         float raw_ao = saturate(ao_tight * 0.55 + ao_wide * 0.45);
-        float ao_shaped = pow(raw_ao, 1.15);
+        float ao_shaped = pow(raw_ao, 1.02);
         open = lerp(1.0, lerp(ao_floor, 1.0, ao_shaped), dist_fade);
         bent_n = normalize(n + bent * (0.045 * dist_fade));
     }
@@ -439,22 +439,22 @@ void raise(uint3 at : SV_DispatchThreadID) {
             }
         }
         float s_fade = saturate(1.0 - (c.z - 60.0) / 60.0);
-        dir_shadow = lerp(1.0, lerp(1.0, 0.32, occ_max * saturate(strength * 0.75)), s_fade);
+        dir_shadow = lerp(1.0, lerp(1.0, 0.56, occ_max * saturate(strength * 0.75)), s_fade);
     }
     float4 sky_entry = cells[3 * CELLS + 1];
-    float hemi_floor = clamp(ceiling_floor, 0.36, 0.85);
+    float hemi_floor = clamp(ceiling_floor, 0.42, 0.85);
     if (sky_entry.a > 0.0) {
         // Calibrated sky-dome indirect floor with lifted ceiling hemisphere so
-        // indoor ceilings stay illuminated while sun shadows stay crisp outdoors.
+        // indoor rooms & cutscenes stay bright while sun shadows stay crisp outdoors.
         float all_luma = max(dot(all, LUMA), 1e-4);
-        float3 dir_ratio = clamp(dir_sh / all_luma, 0.45, 1.90);
-        float3 room_avg = max(cells[CELLS].rgb, float3(0.008, 0.0078, 0.0075));
-        float room_luma = max(dot(room_avg, LUMA), 0.008);
-        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.55, 1.55), 0.42);
+        float3 dir_ratio = clamp(dir_sh / all_luma, 0.52, 1.85);
+        float3 room_avg = max(cells[CELLS].rgb, float3(0.012, 0.0118, 0.0112));
+        float room_luma = max(dot(room_avg, LUMA), 0.012);
+        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.60, 1.50), 0.40);
         float hemi = lerp(hemi_floor, 1.0, saturate(bent_n.y * 0.5 + 0.5));
-        float indoor_fill = lerp(1.0, 0.48, saturate((c.z - 12.0) / 18.0));
-        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.60)
-            * hemi * indoor_fill * max(level, 0.65);
+        float indoor_fill = lerp(1.0, 0.62, saturate((c.z - 12.0) / 18.0));
+        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.55)
+            * hemi * indoor_fill * max(level, 0.85);
         bounce = max(bounce, sky_fill);
     } else if (reflect_floor > 0.0) {
         float3 room_avg = max(cells[CELLS].rgb, float3(0.012, 0.0118, 0.0112));
@@ -540,12 +540,12 @@ void clamp_reflect(uint3 at : SV_DispatchThreadID) {
     float base_luma = max(dot(base, LUMA), 0.02);
     float has = dot(c, LUMA);
     if (air > 0.0) {
-        // Soft-knee shoulder: keeps glossy SSR reflections crisp up to `knee`
-        // while suppressing unoccluded indoor white sky-glaze on eyes/floors/cloth.
+        // Tight soft-knee shoulder: keeps genuine mirrors/SSR crisp up to `knee`
+        // while suppressing over-glossy unoccluded sky glare on skin, cloth, cars, and floors.
         float knee = air * base_luma;
         if (has > knee) {
             float excess = has - knee;
-            float compressed = knee + excess / (1.0 + excess / max(knee * 0.50, 0.04));
+            float compressed = knee + excess / (1.0 + excess / max(knee * 0.22, 0.02));
             c *= compressed / max(has, 1e-6);
         }
     }
@@ -693,6 +693,32 @@ pub(crate) struct Views {
     pub(crate) sampler_heap: Option<ID3D12DescriptorHeap>,
 }
 
+/// Time-based EMA factor (`VICTORY_AMBIENT_SETTLE=<ms>`, default `250` ms;
+/// `0` falls back to fixed per-frame `fallback`) so lighting adapts cleanly
+/// across cutscene cuts and indoor transitions instead of staying dark for seconds.
+fn settle_alpha(last_ms: &std::sync::atomic::AtomicU64, fallback: f32) -> f32 {
+    static TAU_MS: OnceLock<f32> = OnceLock::new();
+    let tau = *TAU_MS.get_or_init(|| {
+        let raw = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_default();
+        let first = raw.split(',').next().unwrap_or("").trim();
+        if first.is_empty() {
+            250.0
+        } else {
+            first.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(250.0)
+        }
+    });
+    if tau <= 0.0 {
+        return fallback;
+    }
+    let now = crate::host::now_ms();
+    let prev = last_ms.swap(now, Ordering::Relaxed);
+    if prev == 0 {
+        return 1.0;
+    }
+    let dt = now.saturating_sub(prev).clamp(1, 2000) as f32;
+    (1.0 - (-dt / tau).exp()).clamp(fallback, 0.22)
+}
+
 /// Samples the title's sky dome (`ps_sky_paraboloid_reflection`) into
 /// `cells[3 * CELLS + 1]` and restores the list's descriptor heaps.
 fn update_sky(list: &HostList, pass: &Pass, views: &Views, g: &crate::graphics::Settings) {
@@ -747,8 +773,10 @@ fn update_sky(list: &HostList, pass: &Pass, views: &Views, g: &crate::graphics::
             },
         };
         host.device.CreateShaderResourceView(&sky_copy.texture, Some(&srv), cpu);
+        static LAST_SKY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sky_alpha = settle_alpha(&LAST_SKY_MS, 0.08);
         let l = &list.list;
-        let sky_consts = [gain.to_bits(), least.to_bits(), power.to_bits(), 0.08f32.to_bits()];
+        let sky_consts = [gain.to_bits(), least.to_bits(), power.to_bits(), sky_alpha.to_bits()];
         l.SetDescriptorHeaps(&[Some(pass.sky_heap.clone())]);
         l.SetComputeRootSignature(&pass.sky_root);
         l.SetComputeRoot32BitConstants(0, 4, sky_consts.as_ptr().cast(), 0);
@@ -822,9 +850,15 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
+    static LAST_RAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     words[6] = views.size[0];
     words[7] = views.size[1];
-    words[8] = 0.04f32.to_bits();
+    words[8] = if role == Role::Radiance {
+        settle_alpha(&LAST_RAD_MS, 0.04)
+    } else {
+        0.04f32
+    }
+    .to_bits();
     words[9] = g.ambient_most.to_bits();
     words[10] = if role == Role::Reflect { reflect_cap } else { g.air_cap }.to_bits();
     words[11] = if role == Role::Resolve { g.ambient_floor } else { reflect_floor }.to_bits();

@@ -1217,6 +1217,9 @@ struct Hosted {
     used: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
+    /// When the card last had no room for it (`crate::host::moment`; 0:
+    /// never): tried again on a later use after [`NO_ROOM_AGAIN_MS`] (#3198).
+    no_room: std::sync::atomic::AtomicU64,
     /// Its host copy was let go as idle once.
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
@@ -1385,6 +1388,33 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`hold`], [`alias_of`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of. `None` if it is no texture, or is being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    // A texture leaves the table before it is freed, under this lock.
+    let all = textures();
+    (all.contains(&(this as usize)) && crate::object::add_ref_alive(this)).then(|| Held(this))
+}
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1414,7 +1444,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1475,7 +1505,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    // Pinned under the lock: once it is let go, the title can drop its last
+    // reference, and the caller's alias copy still needs the texture.
+    if !same || !crate::object::add_ref_alive(other) {
+        return None;
+    }
+    Some(Held(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1531,6 +1566,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if !make || r.host.refused.load(Relaxed) {
             return None;
         }
+        // The card had no room for it a moment ago: wait before retrying (#3198).
+        let no_room = r.host.no_room.load(Relaxed);
+        if no_room != 0 && !crate::host::long_ago(no_room, NO_ROOM_AGAIN_MS, 0) {
+            return None;
+        }
         let clear = r
             .host
             .clear
@@ -1562,7 +1602,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
+            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok() } else { None };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1586,13 +1626,22 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Some(texture),
+            Some(texture) => Ok(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
-        let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
-            return None;
+        let texture = match texture {
+            Ok(texture) => texture,
+            Err(NoTexture::Refused) => {
+                r.host.refused.store(true, Relaxed);
+                return None;
+            }
+            // Upstream VIctory #3198: out of card room is temporary, not permanent refusal.
+            Err(NoTexture::ForNow) => {
+                r.host.no_room.store(crate::host::moment().max(1), Relaxed);
+                return None;
+            }
         };
+        r.host.no_room.store(0, Relaxed);
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
         // the one target dumps and the captured frame's list of commands
@@ -2067,6 +2116,9 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
+    // `VICTORY_TEXTURE_EVICT=1` (off by default): with the card's memory
+    // short, idle copies that only descriptor slots still hold go too.
+    let (evicted, waits) = evict_slot_held(&all, idle_ms, IDLE_FRAMES);
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
     if most != u64::MAX {
@@ -2097,13 +2149,20 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in evicted
+        .iter()
+        .copied()
+        .chain(all.range(from..).take(part).copied())
+        .chain(by_age.iter().map(|&(_, at)| at))
+    {
         if bytes >= most {
             break;
         }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+        if !evicted.contains(&at) {
+            looked += 1;
+            if part == PART {
+                FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+            }
         }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
@@ -2118,7 +2177,7 @@ pub(crate) fn let_go_idle() {
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                    && (crate::host::references(&host.texture) == 1 || evicted.contains(&at))
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -2145,6 +2204,12 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    // The copies are gone: their slots wait for the next ones.
+    let slots = waits.len();
+    crate::descriptor::note_waiting(waits);
+    if slots > 0 {
+        EVICTED_SLOTS.fetch_add(slots as u64, Relaxed);
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2160,6 +2225,57 @@ pub(crate) fn let_go_idle() {
 /// longest one's.
 #[cfg(windows)]
 pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Slots [`evict_slot_held`] let go since the start (for the log).
+#[cfg(windows)]
+pub(crate) static EVICTED_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_TEXTURE_EVICT=1`: under pressure on the card's memory (no room
+/// for new texture copies, or nine tenths of the budget used), the idle host
+/// copies of textures the title fills that no list holds but some slot does,
+/// up to 512 MB a sweep, are taken out of their slots. Returns those title
+/// textures (the sweep then lets their copies go) and the slots, for
+/// [`crate::descriptor::note_waiting`] once the copies are gone.
+#[cfg(windows)]
+fn evict_slot_held(all: &std::collections::BTreeSet<usize>, idle_ms: u64, idle_frames: u64) -> (std::collections::HashSet<usize>, Vec<(usize, u64)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST: u64 = 512 << 20;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let none = (std::collections::HashSet::new(), Vec::new());
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_EVICT").is_some_and(|v| v == "1")) {
+        return none;
+    }
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let pressed = !room(video)
+        || video.is_some_and(|[budget, used, ..]| budget > 0 && used >= budget / 10 * 9);
+    if !pressed {
+        return none;
+    }
+    let mut by_texture = std::collections::HashMap::new();
+    let mut bytes = 0u64;
+    for &at in all {
+        if bytes >= MOST {
+            break;
+        }
+        // SAFETY: as in `let_go_idle`, under the same table lock.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((host, _)) = made.as_ref()
+            && crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
+            && std::sync::Arc::strong_count(host) == 1
+            && crate::host::references(&host.texture) > 1
+        {
+            by_texture.insert(windows::core::Interface::as_raw(&host.texture) as usize, at);
+            bytes += host.bytes;
+        }
+    }
+    let waits = crate::descriptor::release_slots_of(&by_texture);
+    let held: std::collections::HashSet<usize> = waits.iter().map(|&(resource, _)| resource).collect();
+    (held, waits)
+}
 
 /// For the memory line: the host copies the sweep never lets go
 /// ([`let_go_idle`] takes only copies of textures the title fills that the
@@ -2416,6 +2532,22 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, false).map(|made| made.0)
 }
 
+/// Why [`host_texture`] made no host texture (upstream VIctory #3198).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoTexture {
+    Refused,
+    ForNow,
+}
+
+#[cfg(windows)]
+const NO_ROOM_AGAIN_MS: u64 = 1000;
+
+#[cfg(windows)]
+fn no_texture(code: i32) -> NoTexture {
+    if code == E_OUTOFMEMORY { NoTexture::ForNow } else { NoTexture::Refused }
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -2423,7 +2555,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2435,13 +2567,13 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
-        return None;
+        return Err(NoTexture::Refused);
     }
-    let host = crate::host::host()?;
+    let host = crate::host::host().ok_or(NoTexture::ForNow)?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2510,7 +2642,7 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Some(t);
+        return Ok(t);
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2546,7 +2678,14 @@ fn host_texture_as(
         }
     };
     if let Err(e) = &made {
-        tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
+        let why = no_texture(e.code().0);
+        static NO_ROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = (why == NoTexture::ForNow)
+            .then(|| NO_ROOM.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+        if n.is_none_or(u64::is_power_of_two) {
+            tracing::warn!(error = %e, desc = ?d, reserved, ?why, times = n, "no host texture");
+        }
+        return Err(why);
     }
     if !reserved
         && made.is_ok()
@@ -2554,17 +2693,16 @@ fn host_texture_as(
     {
         if let Err(e) = crate::host::resident(&host.device, t) {
             tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-            texture = None;
+            return Err(NoTexture::ForNow);
         } else {
             crate::host::note_unmapped();
         }
     }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
-        });
-    }
-    texture
+    let texture = texture.ok_or(NoTexture::Refused)?;
+    crate::host::name(&texture, || {
+        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+    });
+    Ok(texture)
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -2703,6 +2841,7 @@ fn hand_out_resource(
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
+            no_room: std::sync::atomic::AtomicU64::new(0),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3912,6 +4051,142 @@ mod tests {
         }
     }
 
+    /// An earlier title-memory upload must not suppress a later alias copy
+    /// from a GPU-written probe atlas into the same sampled texture.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn alias_after_title_upload_copies_the_gpu_atlas() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        let written = host_resource(source).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        let packed_light = 0x8c02_0100_u32;
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(packed_light);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, source));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the completed copy contains at least one 32-bit texel.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        resource_release(view);
+        resource_release(source);
+        assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
+    }
+
+    /// The source a placed view aliases is held while the caller copies it:
+    /// the title may let go of its own reference between the lookup and the
+    /// copy (or a recording thread may), and the copy still needs it.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        // The title lets go: the pin, not the title's reference, keeps the
+        // source (and the copy about to be made from it) alive.
+        resource_release(source);
+        assert!(host_resource(held.get()).is_some(), "a held source is still copyable");
+        assert!(textures().contains(&(source as usize)), "the held source is not freed");
+        drop(held);
+        assert!(!textures().contains(&(source as usize)), "the last reference frees it");
+        resource_release(view);
+    }
     /// A 16-bit depth texture the title also asks unordered access for gets
     /// a colour twin, and the host copies one into the other, both ways: a
     /// pattern put into the twin is copied to the depth texture, the twin

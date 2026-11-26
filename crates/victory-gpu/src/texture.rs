@@ -287,7 +287,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // An upload from title memory can have already used this view. Only
+    // a copy from the same GPU source can satisfy this read (fork PR #1241).
+    list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -302,7 +305,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -845,7 +848,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             },
         };
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[aliasing]) };
+        unsafe { list.list.barriers(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred

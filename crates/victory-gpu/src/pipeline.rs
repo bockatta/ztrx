@@ -148,6 +148,7 @@ pub(crate) struct Translated {
     /// A compute program's threads in a group.
     pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
@@ -240,10 +241,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
     Ok(Translated {
         host,
         threads,
         used,
+        tables,
         stores,
         stores_by_address,
         picks: Default::default(),
