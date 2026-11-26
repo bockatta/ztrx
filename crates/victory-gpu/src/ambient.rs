@@ -69,9 +69,8 @@ pub(crate) fn sky_drawn(image: usize) {
 }
 
 /// Sky-dome exposure curve (`VICTORY_AMBIENT_SKY=gain,least,power`, default
-/// `0.95,0.07,0.45`; set `off` to disable sky tracking).
-/// Maps night (`~0.001`) -> ~0.11, dusk/sunset (`~0.65`) -> ~0.85,
-/// midday/cafe (`~2..5`) -> ~1.37..2.03 linear HDR to match title auto-exposure.
+/// `0.36,0.03,0.42`, calibrated after Belobug e48eb83e/4f62c2a5 so real sun
+/// and interior shadows keep crisp contrast; set `off` to disable sky tracking).
 fn sky_follow() -> Option<[f32; 3]> {
     static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -79,7 +78,7 @@ fn sky_follow() -> Option<[f32; 3]> {
         if set.trim().eq_ignore_ascii_case("off") || set.trim() == "0" {
             return None;
         }
-        let mut follow = [0.95f32, 0.07, 0.45];
+        let mut follow = [0.36f32, 0.03, 0.42];
         for (to, v) in follow.iter_mut().zip(set.split(',')) {
             if let Ok(v) = v.trim().parse::<f32>()
                 && v.is_finite()
@@ -155,9 +154,18 @@ fn set() -> Set {
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// Opt-in hybrid mode (`VICTORY_AMBIENT_WITH_RT=1`): allow subtle ambient
+/// bounce + reflection soft-knee to fill unmapped indoor voids alongside the
+/// ray-tracing structure builder (`VICTORY_BVH_BUILDER=1`).
+fn with_rt() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_WITH_RT").is_some_and(|v| v == "1"))
+}
+
+/// Whether the stand-in is on: set, and either the builder is off or
+/// hybrid `VICTORY_AMBIENT_WITH_RT=1` is enabled.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && (!crate::pipeline::builder_runs() || with_rt())
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -227,7 +235,7 @@ fn ambient_floor() -> f32 {
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| {
-        let mut shade = [1.05, 0.65];
+        let mut shade = [1.35, 0.80];
         let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
         for (to, v) in shade.iter_mut().zip(set.split(',')) {
             if let Ok(v) = v.trim().parse() {
@@ -451,14 +459,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
             }
             sum_wide /= NW;
         }
-        float ao_tight = saturate(1.0 - strength * 1.70 * sum_tight);
-        float ao_wide  = saturate(1.0 - strength * 1.60 * sum_wide);
+        float ao_tight = saturate(1.0 - strength * 1.75 * sum_tight);
+        float ao_wide  = saturate(1.0 - strength * 1.65 * sum_wide);
         float dist_fade = saturate(1.0 - (c.z - 220.0) / 130.0);
-        // Physical multi-bounce lift: deep creases drop to crisp 28% shadow contrast
-        // rather than blacking out entire room walls.
+        // Deep physical multi-bounce AO (floor 0.09) so under-bunk cavities,
+        // shelf undersides, chair legs, and chin/collar creases hold crisp shadows.
         float raw_ao = saturate(ao_tight * 0.55 + ao_wide * 0.45);
-        open = lerp(1.0, lerp(0.28, 1.0, raw_ao), dist_fade);
-        bent_n = normalize(n + bent * (0.035 * dist_fade));
+        float ao_shaped = pow(raw_ao, 1.15);
+        open = lerp(1.0, lerp(0.09, 1.0, ao_shaped), dist_fade);
+        bent_n = normalize(n + bent * (0.045 * dist_fade));
     }
     float3 found;
     if (constant > 0.0) {
@@ -486,39 +495,75 @@ void raise(uint3 at : SV_DispatchThreadID) {
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
     // Directional SH1 bounce evaluated along bent normal for grounded colored bounce.
-    float3 dir_sh = all + 1.45 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
-    dir_sh = clamp(dir_sh, 0.15 * all, 2.8 * all);
+    float3 dir_sh = all + 1.55 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
+    dir_sh = clamp(dir_sh, 0.12 * all, 2.8 * all);
     float3 bounce = lerp(dir_sh, cells[CELLS].rgb, 0.08) * level;
+    // Screen-space directional contact shadows along dominant SH1 incoming light
+    // (windows / ceiling lamps) so bunks, shelves, tables, chairs, and collars
+    // cast grounded shadows without foreground depth-jump halos.
+    float dir_shadow = 1.0;
+    if (strength > 0.0 && c.z < 120.0) {
+        float3 sh_vec = (sr.xyz * LUMA.r + sg.xyz * LUMA.g + sb.xyz * LUMA.b) / sum;
+        float sh_len = length(sh_vec);
+        float3 up_bias = float3(0.0, 0.78, -0.32);
+        float3 l_dir = sh_len > 1e-4 ? (sh_vec / sh_len) : up_bias;
+        float3 ray_dir = normalize(lerp(up_bias, l_dir, saturate(sh_len / max(dot(all, LUMA) * 0.45, 1e-4))));
+        float aspect = size.x / size.y;
+        float occ_max = 0.0;
+        float max_reach = min(radius * 1.35, 1.15);
+        float thick = max(0.04, 0.018 * c.z);
+        const int NS = 8;
+        for (int s = 0; s < NS; s++) {
+            float frac_s = (float(s) + 0.35 + 0.65 * noise) / float(NS);
+            float dist_m = max_reach * (frac_s * frac_s);
+            float3 sp = c + ray_dir * dist_m;
+            if (sp.z <= near) break;
+            float2 sndc = float2(sp.x / (sp.z * tan_y * aspect), -sp.y / (sp.z * tan_y));
+            int2 sq = int2((sndc * 0.5 + 0.5) * size);
+            if (sq.x < 0 || sq.y < 0 || sq.x >= int(width) || sq.y >= int(height)) break;
+            float scene_z = seen(sq, size).z;
+            float dz = sp.z - scene_z;
+            if (dz > 0.015 && dz < thick + 0.35 * dist_m) {
+                float weight = saturate(1.0 - frac_s * 0.72) * saturate(1.0 - dz / (thick + 0.45 * dist_m));
+                occ_max = max(occ_max, weight);
+            }
+        }
+        float s_fade = saturate(1.0 - (c.z - 60.0) / 60.0);
+        dir_shadow = lerp(1.0, lerp(1.0, 0.28, occ_max * saturate(strength * 0.75)), s_fade);
+    }
     float4 sky_entry = cells[3 * CELLS + 1];
     if (sky_entry.a > 0.0) {
-        // Exposure-matched sky-dome indirect floor (Belobug e48eb83e/4f62c2a5),
-        // modulated by our directional SH1 lighting ratio and warm room tint so
-        // daytime interiors (cafe) are properly exposed with full 3D bounce & GTAO,
-        // while sunset (prison) and night stay naturally dark and atmospheric!
+        // Calibrated sky-dome indirect floor modulated by directional SH1 ratio,
+        // hemisphere normal orientation (undersides stay dark), and distance fade
+        // so GTA VI's 2048x8192 sun shadow map keeps crisp outdoor shadow contrast.
         float all_luma = max(dot(all, LUMA), 1e-4);
-        float3 dir_ratio = clamp(dir_sh / all_luma, 0.45, 1.90);
+        float3 dir_ratio = clamp(dir_sh / all_luma, 0.40, 1.90);
         float3 room_avg = max(cells[CELLS].rgb, float3(0.005, 0.0049, 0.0047));
         float room_luma = max(dot(room_avg, LUMA), 0.005);
-        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.55, 1.55), 0.40);
-        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.55) * max(level, 1.0);
+        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.55, 1.55), 0.42);
+        float hemi = lerp(0.36, 1.0, saturate(bent_n.y * 0.5 + 0.5));
+        float indoor_fill = lerp(1.0, 0.45, saturate((c.z - 12.0) / 18.0));
+        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.65)
+            * hemi * indoor_fill * max(level, 0.65);
         bounce = max(bounce, sky_fill);
     } else if (reflect_floor > 0.0) {
         float3 room_avg = max(cells[CELLS].rgb, float3(0.01, 0.0098, 0.0094));
         float room_luma = max(dot(room_avg, LUMA), 0.01);
         float3 room_tint = lerp(float3(1.0, 0.98, 0.94), clamp(room_avg / room_luma, 0.4, 1.8), 0.55);
-        bounce = max(bounce, room_tint * reflect_floor);
+        float hemi = lerp(0.40, 1.0, saturate(bent_n.y * 0.5 + 0.5));
+        bounce = max(bounce, room_tint * reflect_floor * hemi);
     }
-    found = bounce * open;
+    found = bounce * open * dir_shadow;
     if (most <= 0.0) {
         light[p] = pack(found);
         return;
     }
     float3 was = unpack(light[p]);
-    // Keep the title's own screen-space traced bounce & sky light where valid,
-    // modulated by our dual-scale GTAO so contact & corner shadows stay crisp.
+    // Keep the title's own screen-space/RT traced bounce & sky light where valid,
+    // modulated gently by contact shadow contrast.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6)) * lerp(1.0, open, 0.70);
+    was *= min(1.0, top / max(has, 1e-6)) * lerp(1.0, open * dir_shadow, 0.55);
     light[p] = pack(max(was, found));
 }
 #endif

@@ -106,6 +106,8 @@ const BACK: u64 = 256 << 10;
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+/// Optional override (`VICTORY_BVH_FAULTS_MAX=<pages>`) for RT runs that need more fault pages.
+static MAX_FAULTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -675,8 +677,15 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        let max_faults = *MAX_FAULTS.get_or_init(|| {
+            std::env::var("VICTORY_BVH_FAULTS_MAX")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n >= FAULTS)
+                .unwrap_or(FAULTS_ALL)
+        });
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            if made < FAULTS && self.faulted < max_faults && self.copy_of(page).is_none() && self.map(page) {
                 made += 1;
                 self.faulted += 1;
                 self.bring(page, page + 1);

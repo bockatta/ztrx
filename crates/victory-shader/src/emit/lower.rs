@@ -3350,7 +3350,17 @@ impl<'a> Lower<'a> {
     /// number is left for the host, for lanes that run (`guard`).
     /// With `store`, a page marked [`super::shader::MEMORY_READ_ONLY`] maps to
     /// the null view.
+    /// Title memory at `lo`/`hi`: returns `(handle, byte)` for the host copy.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
+        let (h, byte, _) = self.memory_mapped(lo, hi, guard, store);
+        (h, byte)
+    }
+
+    /// Title memory at `lo`/`hi`: returns `(handle, byte, mapped)` where
+    /// `mapped` (`i1`) is true when the 64 KiB page has a resident host copy
+    /// (`copy != 0`). With `store`, a page marked [`super::shader::MEMORY_READ_ONLY`]
+    /// maps to the null view.
+    pub(super) fn memory_mapped(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -3386,6 +3396,7 @@ impl<'a> Lower<'a> {
         // A page without a copy: its number, at a place by the number, or
         // at the sink for lanes that do not run and pages that have one.
         let zero = k(self, 0);
+        let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
@@ -3420,7 +3431,7 @@ impl<'a> Lower<'a> {
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        (h, byte, mapped)
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
