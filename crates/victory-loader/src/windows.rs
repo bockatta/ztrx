@@ -208,6 +208,10 @@ impl LoadedImage {
         self.module as usize
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Parsed from the original image (imports, entry point, TLS callbacks).
     pub fn info(&self) -> &ImageInfo {
         &self.info

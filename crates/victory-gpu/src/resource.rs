@@ -2491,8 +2491,10 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Reserved (`VICTORY_LEVELS_ON_DEMAND=1`) textures must
+    // skip the pool so `CreateReservedResource` below runs instead.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2549,10 +2551,13 @@ fn host_texture_as(
     if !reserved
         && made.is_ok()
         && let Some(t) = &texture
-        && let Err(e) = crate::host::resident(&host.device, t).and_then(|()| crate::host::mapped(&host.device))
     {
-        tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
-        texture = None;
+        if let Err(e) = crate::host::resident(&host.device, t) {
+            tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
+            texture = None;
+        } else {
+            crate::host::note_unmapped();
+        }
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {

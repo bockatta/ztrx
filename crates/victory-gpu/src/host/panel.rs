@@ -14,10 +14,13 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3, VK_F9};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3, VK_F4, VK_F5, VK_F6, VK_F9};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::{Host, HostList, transition};
+
+#[path = "cursor.rs"]
+mod cursor;
 
 /// How often the numbers change.
 const EVERY: Duration = Duration::from_millis(500);
@@ -27,7 +30,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 10;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -45,6 +48,13 @@ fn shown() -> &'static AtomicBool {
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
 
+fn foreground_is_ours() -> bool {
+    let mut process = 0;
+    // SAFETY: plain queries; room for the answer.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
+    process == std::process::id()
+}
+
 /// F3 or F9 was pressed since the last call, with one of our windows in front.
 fn pressed() -> bool {
     static DOWN: AtomicBool = AtomicBool::new(false);
@@ -53,10 +63,38 @@ fn pressed() -> bool {
     if DOWN.swap(down, Ordering::Relaxed) || !down {
         return false;
     }
-    let mut process = 0;
-    // SAFETY: plain queries; room for the answer.
-    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
-    process == std::process::id()
+    foreground_is_ours()
+}
+
+/// Polls runtime graphics hotkeys (F4 cycle preset, F5 cycle AO taps, F6 cycle
+/// contact shadows) when one of our windows is foreground.
+fn poll_graphics_hotkeys() {
+    static F4_DOWN: AtomicBool = AtomicBool::new(false);
+    static F5_DOWN: AtomicBool = AtomicBool::new(false);
+    static F6_DOWN: AtomicBool = AtomicBool::new(false);
+    // SAFETY: plain queries.
+    let (f4, f5, f6) = unsafe {
+        (
+            GetAsyncKeyState(i32::from(VK_F4)) < 0,
+            GetAsyncKeyState(i32::from(VK_F5)) < 0,
+            GetAsyncKeyState(i32::from(VK_F6)) < 0,
+        )
+    };
+    let e4 = f4 && !F4_DOWN.swap(f4, Ordering::Relaxed);
+    let e5 = f5 && !F5_DOWN.swap(f5, Ordering::Relaxed);
+    let e6 = f6 && !F6_DOWN.swap(f6, Ordering::Relaxed);
+    if !(e4 || e5 || e6) || !foreground_is_ours() {
+        return;
+    }
+    if e4 {
+        crate::graphics::cycle_preset();
+    }
+    if e5 {
+        crate::graphics::cycle_shading();
+    }
+    if e6 {
+        crate::graphics::cycle_shadows();
+    }
 }
 
 /// Seven rows of five dots, the leftmost the highest bit.
@@ -232,6 +270,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         ram_line,
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
+        crate::graphics::hud_line(),
         format!("THIS PANEL {:.0} US A FRAME", cost),
     ]
 }
@@ -305,6 +344,7 @@ pub(super) struct Panel {
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
+    cursor: cursor::CursorOverlay,
 }
 
 impl Panel {
@@ -321,12 +361,14 @@ impl Panel {
             changed: false,
             buffers: None,
             failed: false,
+            cursor: cursor::CursorOverlay::new(),
         }
     }
 
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
     pub(super) fn frame(&mut self, line: bool) {
+        poll_graphics_hotkeys();
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
@@ -359,9 +401,24 @@ impl Panel {
         self.cost = now.elapsed();
     }
 
-    /// Records the copy of the box onto `back`, a buffer of the swap chain of
-    /// that size and format in the state to be copied into.
+    /// Records the copy of the box and on-screen cursor onto `back`, a buffer
+    /// of the swap chain of that size and format in the state to be copied into.
     pub(super) fn draw(
+        &mut self,
+        host: &Host,
+        list: &HostList,
+        back: &ID3D12Resource,
+        (width, height): (u32, u32),
+        format: DXGI_FORMAT,
+    ) {
+        // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
+        let _ours = crate::replay::record::unrecorded();
+        self.draw_box(host, list, back, (width, height), format);
+        self.cursor.draw(host, list, back, (width, height), format);
+    }
+
+    fn draw_box(
         &mut self,
         host: &Host,
         list: &HostList,
@@ -373,9 +430,6 @@ impl Panel {
             return;
         }
         let began = Instant::now();
-        // Not the title's: the frame recorder leaves it out.
-        #[cfg(feature = "diagnostics")]
-        let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
             // (What the card may still read stays: a picture's size changes once or twice in a run.)

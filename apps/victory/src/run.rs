@@ -53,6 +53,19 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    victory_hle::graphics::apply_file_overrides(&victory_hle::graphics::FileOverrides {
+        preset: cfg.graphics.preset.clone(),
+        lighting: cfg.graphics.lighting,
+        shading: cfg.graphics.shading,
+        shadows: cfg.graphics.shadows,
+        ao_taps: cfg.graphics.ao_taps,
+        contact_steps: cfg.graphics.contact_steps,
+        gather_step: cfg.graphics.gather_step,
+        ambient_level: cfg.graphics.ambient_level,
+        ceiling_floor: cfg.graphics.ceiling_floor,
+        air_cap: cfg.graphics.air_cap,
+        reflect_cap: cfg.graphics.reflect_cap,
+    });
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -167,6 +180,18 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
+        for (_, dll) in &dlls {
+            if let Some(name) = dll.path().file_name().and_then(|n| n.to_str()) {
+                // SAFETY: the DLL stays mapped, and `attach` has not run yet.
+                unsafe {
+                    victory_loader::write_sites::apply_asked(
+                        name,
+                        dll.base(),
+                        dll.info().size_of_image as usize,
+                    )
+                };
+            }
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
@@ -367,6 +392,18 @@ impl LateDlls {
                 mapped.extend(new.iter().cloned());
                 new
             };
+            for (_, dll) in &new {
+                if let Some(name) = dll.path().file_name().and_then(|n| n.to_str()) {
+                    // SAFETY: the DLL stays mapped, and `attach` has not run yet.
+                    unsafe {
+                        victory_loader::write_sites::apply_asked(
+                            name,
+                            dll.base(),
+                            dll.info().size_of_image as usize,
+                        )
+                    };
+                }
+            }
             let failed = new.iter().enumerate().find_map(|(i, (name, dll))| {
                 // SAFETY: bound above, dependencies attached first.
                 let attached = unsafe { dll.attach() };

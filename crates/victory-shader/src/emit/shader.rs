@@ -42,6 +42,17 @@ pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
 /// Dwords of the whole [`SLOT_STRIDES`] buffer: the strides, then the
 /// addresses ([`SLOT_ADDRESSES`]).
 pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
+/// LOCAL (port of fxceless/victory-fork PR #1216, GamingRipperDoc): the
+/// [`SLOT_STRIDES`] dword of a slot that holds a constant buffer view (a
+/// stride no buffer has, no kind bits).
+pub const SLOT_STRIDE_CONSTANT: u32 = VIEW_STRIDE_BITS;
+
+/// Whether [`SLOT_STRIDE_CONSTANT`] is in use: read once, by the host and
+/// the translator alike (`VICTORY_CONSTANT_MARKS=1`).
+pub fn constant_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_some_and(|v| v == "1"))
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

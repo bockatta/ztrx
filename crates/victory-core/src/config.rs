@@ -22,8 +22,29 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// Optional `[graphics]` settings loaded from `victory.toml`.
+    pub graphics: GraphicsConfig,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+}
+
+/// Optional graphics module settings from `[graphics]` in `victory.toml`.
+/// Environment variables (`VICTORY_GRAPHICS_*`, `VICTORY_AMBIENT*`) and
+/// live hotkeys (`F4`/`F5`/`F6`) override these values.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphicsConfig {
+    pub preset: Option<String>,
+    pub lighting: Option<bool>,
+    pub shading: Option<bool>,
+    pub shadows: Option<bool>,
+    pub ao_taps: Option<u32>,
+    pub contact_steps: Option<u32>,
+    pub gather_step: Option<u32>,
+    pub ambient_level: Option<f32>,
+    pub ceiling_floor: Option<f32>,
+    pub air_cap: Option<f32>,
+    pub reflect_cap: Option<f32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +52,8 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    graphics: GraphicsConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,11 +93,12 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed.paths, parsed.graphics, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
         file: FilePaths,
+        graphics: GraphicsConfig,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
@@ -96,6 +120,7 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            graphics,
             source,
         })
     }
@@ -157,7 +182,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, GraphicsConfig::default(), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
     }
@@ -169,7 +194,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, GraphicsConfig::default(), None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
@@ -180,7 +205,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, GraphicsConfig::default(), None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
 
@@ -189,11 +214,27 @@ mod tests {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, GraphicsConfig::default(), None, env).unwrap();
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
         );
+    }
+
+    #[test]
+    fn graphics_section_parses_and_rejects_unknown_fields() {
+        let parsed: FileConfig = toml::from_str(
+            "[graphics]\npreset = 'performance'\nlighting = true\nao_taps = 4\ncontact_steps = 0\nceiling_floor = 0.58\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.graphics.preset.as_deref(), Some("performance"));
+        assert_eq!(parsed.graphics.lighting, Some(true));
+        assert_eq!(parsed.graphics.ao_taps, Some(4));
+        assert_eq!(parsed.graphics.contact_steps, Some(0));
+        assert_eq!(parsed.graphics.ceiling_floor, Some(0.58));
+
+        let bad = toml::from_str::<FileConfig>("[graphics]\nunknown_key = 1\n");
+        assert!(bad.is_err());
     }
 
     #[test]

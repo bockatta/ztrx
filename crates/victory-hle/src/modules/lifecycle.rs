@@ -9,8 +9,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -96,6 +96,144 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
+/// Top-level title window handle tracked from `CreateWindowExW`/`CreateWindowExA`.
+static TITLE_HWND: AtomicUsize = AtomicUsize::new(0);
+/// True while the user is dragging/resizing the title window.
+static IN_SIZE_MOVE: AtomicBool = AtomicBool::new(false);
+/// Accumulated horizontal/vertical mouse wheel deltas (`WHEEL_DELTA = 120` per notch).
+static WHEEL_X: AtomicI64 = AtomicI64::new(0);
+static WHEEL_Y: AtomicI64 = AtomicI64::new(0);
+/// Incremented on `WM_SETFOCUS` / `WM_KILLFOCUS`.
+static FOCUS_SERIAL: AtomicU64 = AtomicU64::new(0);
+/// Packed latest client-area pointer state from `WM_MOUSEMOVE`:
+/// bits 0..=15 = u_q16, bits 16..=31 = v_q16, bit 32 = in_client, bit 33 = valid.
+static CLIENT_CURSOR: AtomicU64 = AtomicU64::new(0);
+/// Virtual-key bitset updated by `WM_KEYDOWN`/`WM_KEYUP` (`WM_SYSKEYDOWN`/`WM_SYSKEYUP`)
+/// and cleared on `WM_KILLFOCUS` so posted window key messages work even when unfocused.
+static WINDOW_KEYS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+struct CursorUiState {
+    visible: AtomicBool,
+    cursor_mode: AtomicBool,
+}
+
+fn cursor_ui_state() -> &'static CursorUiState {
+    static STATE: OnceLock<CursorUiState> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let initial_cursor = std::env::var_os("VICTORY_CURSOR").is_some_and(|v| v == "1");
+        CursorUiState {
+            visible: AtomicBool::new(initial_cursor),
+            cursor_mode: AtomicBool::new(initial_cursor),
+        }
+    })
+}
+
+pub(crate) fn set_cursor_ui_state(visible: bool, cursor_mode: bool) {
+    let state = cursor_ui_state();
+    state.visible.store(visible, Ordering::Relaxed);
+    state.cursor_mode.store(cursor_mode, Ordering::Relaxed);
+}
+
+fn should_hide_os_cursor_with(os_cursor_override: bool, visible: bool, cursor_mode: bool) -> bool {
+    !os_cursor_override && (visible || !cursor_mode)
+}
+
+fn should_hide_os_cursor() -> bool {
+    let os_override = std::env::var_os("VICTORY_CURSOR_OS").is_some_and(|v| v == "1");
+    let state = cursor_ui_state();
+    should_hide_os_cursor_with(
+        os_override,
+        state.visible.load(Ordering::Relaxed),
+        state.cursor_mode.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn title_hwnd() -> usize {
+    TITLE_HWND.load(Ordering::Acquire)
+}
+
+pub(crate) fn in_size_move() -> bool {
+    IN_SIZE_MOVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn take_wheel() -> (i64, i64) {
+    (
+        WHEEL_X.swap(0, Ordering::AcqRel),
+        WHEEL_Y.swap(0, Ordering::AcqRel),
+    )
+}
+
+pub(crate) fn focus_serial() -> u64 {
+    FOCUS_SERIAL.load(Ordering::Acquire)
+}
+
+pub(crate) fn client_cursor() -> Option<(f32, f32, bool)> {
+    let packed = CLIENT_CURSOR.load(Ordering::Acquire);
+    if (packed & (1 << 33)) == 0 {
+        return None;
+    }
+    let u = (packed & 0xFFFF) as f32 / 65535.0;
+    let v = ((packed >> 16) & 0xFFFF) as f32 / 65535.0;
+    let in_client = (packed & (1 << 32)) != 0;
+    Some((u, v, in_client))
+}
+
+fn set_client_cursor(u: f32, v: f32, in_client: bool) {
+    let x_q16 = (u.clamp(0.0, 1.0) * 65535.0).round() as u64;
+    let y_q16 = (v.clamp(0.0, 1.0) * 65535.0).round() as u64;
+    let packed = x_q16 | (y_q16 << 16) | (u64::from(in_client) << 32) | (1u64 << 33);
+    CLIENT_CURSOR.store(packed, Ordering::Release);
+}
+
+fn clear_client_in_client() {
+    CLIENT_CURSOR.fetch_and(!(1u64 << 32), Ordering::AcqRel);
+}
+
+fn normalize_window_vk(vk: u8) -> u8 {
+    match vk {
+        0x10 => 0xA0, // VK_SHIFT -> VK_LSHIFT
+        0x11 => 0xA2, // VK_CONTROL -> VK_LCONTROL
+        0x12 => 0xA4, // VK_MENU -> VK_LMENU
+        _ => vk,
+    }
+}
+
+fn set_window_key(vk: u8, down: bool) {
+    let vk = normalize_window_vk(vk);
+    let word = usize::from(vk >> 6);
+    let bit = 1u64 << (vk & 63);
+    if down {
+        WINDOW_KEYS[word].fetch_or(bit, Ordering::Release);
+    } else {
+        WINDOW_KEYS[word].fetch_and(!bit, Ordering::Release);
+    }
+}
+
+fn clear_window_keys() {
+    for word in &WINDOW_KEYS {
+        word.store(0, Ordering::Release);
+    }
+}
+
+pub(crate) fn window_keys() -> Vec<u8> {
+    let mut keys = Vec::new();
+    for (word, slot) in WINDOW_KEYS.iter().enumerate() {
+        let mut bits = slot.load(Ordering::Acquire);
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as u8;
+            keys.push((word as u8) * 64 + bit);
+            bits &= bits - 1;
+        }
+    }
+    keys
+}
+
+fn track_top_level(hwnd: HWND, parent: HWND, style: u32) {
+    if parent.is_null() && !hwnd.is_null() && (style & wm::WS_CHILD) == 0 {
+        TITLE_HWND.store(hwnd as usize, Ordering::Release);
+    }
+}
+
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -117,6 +255,7 @@ pub extern "system" fn CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    track_top_level(hwnd, parent, style);
     hook(hwnd);
     hwnd
 }
@@ -143,6 +282,7 @@ pub extern "system" fn CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
+    track_top_level(hwnd, parent, style);
     hook(hwnd);
     hwnd
 }
@@ -267,10 +407,72 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    match message {
+        wm::WM_MOUSEMOVE => {
+            let x = (lparam as isize & 0xFFFF) as i16;
+            let y = ((lparam as isize >> 16) & 0xFFFF) as i16;
+            let mut rect = RECT::default();
+            // SAFETY: `hwnd` is the window receiving `WM_MOUSEMOVE`.
+            if unsafe { wm::GetClientRect(hwnd, &mut rect) } != 0 {
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
+                if w > 0 && h > 0 {
+                    let u = (f32::from(x) / w as f32).clamp(0.0, 1.0);
+                    let v = (f32::from(y) / h as f32).clamp(0.0, 1.0);
+                    let in_client =
+                        i32::from(x) >= 0 && i32::from(y) >= 0 && i32::from(x) < w && i32::from(y) < h;
+                    set_client_cursor(u, v, in_client);
+                }
+            }
+        }
+        wm::WM_NCMOUSEMOVE => {
+            clear_client_in_client();
+        }
+        wm::WM_MOUSEWHEEL => {
+            let dy = i64::from(((wparam >> 16) & 0xFFFF) as i16);
+            WHEEL_Y.fetch_add(dy, Ordering::AcqRel);
+        }
+        wm::WM_MOUSEHWHEEL => {
+            let dx = i64::from(((wparam >> 16) & 0xFFFF) as i16);
+            WHEEL_X.fetch_add(dx, Ordering::AcqRel);
+        }
+        wm::WM_ENTERSIZEMOVE => {
+            IN_SIZE_MOVE.store(true, Ordering::Release);
+        }
+        wm::WM_EXITSIZEMOVE => {
+            IN_SIZE_MOVE.store(false, Ordering::Release);
+        }
+        wm::WM_KEYDOWN | wm::WM_SYSKEYDOWN => {
+            set_window_key((wparam & 0xFF) as u8, true);
+        }
+        wm::WM_KEYUP | wm::WM_SYSKEYUP => {
+            set_window_key((wparam & 0xFF) as u8, false);
+        }
+        wm::WM_SETFOCUS => {
+            FOCUS_SERIAL.fetch_add(1, Ordering::AcqRel);
+        }
+        wm::WM_KILLFOCUS => {
+            FOCUS_SERIAL.fetch_add(1, Ordering::AcqRel);
+            IN_SIZE_MOVE.store(false, Ordering::Release);
+            clear_client_in_client();
+            clear_window_keys();
+        }
+        wm::WM_SETCURSOR => {
+            if (lparam as isize & 0xFFFF) as u32 == wm::HTCLIENT && should_hide_os_cursor() {
+                // SAFETY: `SetCursor(null)` hides the OS arrow inside `HTCLIENT` while the
+                // swapchain cursor or camera-look mode is active; non-client hit-tests
+                // (`HTCAPTION`, borders) still reach the default window procedure.
+                unsafe { wm::SetCursor(std::ptr::null_mut()) };
+                return 1;
+            }
+        }
+        _ => {}
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
         if message == wm::WM_NCDESTROY {
+            let _ = TITLE_HWND.compare_exchange(hwnd as usize, 0, Ordering::AcqRel, Ordering::Acquire);
             wm::RemovePropW(hwnd, TITLE_PROC);
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
@@ -624,5 +826,224 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    static CURSOR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static RECORDED_MESSAGES: std::cell::RefCell<Vec<(u32, LPARAM)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    extern "system" fn record_messages(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        RECORDED_MESSAGES.with(|m| m.borrow_mut().push((message, lparam)));
+        if message == wm::WM_SETCURSOR {
+            return 42;
+        }
+        // SAFETY: system default proc for synthetic test window.
+        unsafe { wm::DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    #[test]
+    fn window_proc_tracks_mouse_move_wheel_sizemove_focus_and_forwards() {
+        let _guard = CURSOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = take_wheel();
+        IN_SIZE_MOVE.store(false, Ordering::Release);
+        RECORDED_MESSAGES.with(|m| m.borrow_mut().clear());
+
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("input-test"),
+            0,
+            0,
+            0,
+            200,
+            100,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+        assert_eq!(title_hwnd(), hwnd as usize);
+
+        // Creating a child window must not overwrite the tracked top-level HWND.
+        let child = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("child"),
+            wm::WS_CHILD,
+            0,
+            0,
+            10,
+            10,
+            hwnd,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert_eq!(title_hwnd(), hwnd as usize);
+
+        // SAFETY: `hwnd` is owned by this thread; original title proc is restored before destroy.
+        unsafe {
+            let mut rect = RECT::default();
+            assert_ne!(wm::GetClientRect(hwnd, &mut rect), 0);
+            let cw = rect.right - rect.left;
+            let ch = rect.bottom - rect.top;
+            assert!(cw > 0 && ch > 0);
+
+            let title = wm::GetPropW(hwnd, TITLE_PROC);
+            wm::SetPropW(hwnd, TITLE_PROC, record_messages as *const () as *mut c_void);
+
+            let mx = cw / 2;
+            let my = ch / 4;
+            let move_lp = ((my & 0xFFFF) << 16) | (mx & 0xFFFF);
+            wm::SendMessageW(hwnd, wm::WM_MOUSEMOVE, 0, move_lp as LPARAM);
+            let (u, v, in_client) = client_cursor().expect("WM_MOUSEMOVE recorded cursor");
+            assert!(in_client);
+            assert!((u - mx as f32 / cw as f32).abs() < 0.01);
+            assert!((v - my as f32 / ch as f32).abs() < 0.01);
+
+            wm::SendMessageW(hwnd, wm::WM_NCMOUSEMOVE, 0, 0);
+            assert!(!client_cursor().unwrap().2);
+
+            wm::SendMessageW(hwnd, wm::WM_MOUSEMOVE, 0, move_lp as LPARAM);
+            assert!(client_cursor().unwrap().2);
+
+            wm::SendMessageW(hwnd, wm::WM_MOUSEWHEEL, (120i16 as u16 as usize) << 16, 0);
+            wm::SendMessageW(hwnd, wm::WM_MOUSEWHEEL, ((-240i16) as u16 as usize) << 16, 0);
+            wm::SendMessageW(hwnd, wm::WM_MOUSEHWHEEL, (120i16 as u16 as usize) << 16, 0);
+            assert_eq!(take_wheel(), (120, -120));
+            assert_eq!(take_wheel(), (0, 0));
+
+            wm::SendMessageW(hwnd, wm::WM_ENTERSIZEMOVE, 0, 0);
+            assert!(in_size_move());
+            wm::SendMessageW(hwnd, wm::WM_EXITSIZEMOVE, 0, 0);
+            assert!(!in_size_move());
+
+            let f0 = focus_serial();
+            wm::SendMessageW(hwnd, wm::WM_SETFOCUS, 0, 0);
+            let f1 = focus_serial();
+            assert!(f1 > f0);
+            wm::SendMessageW(hwnd, wm::WM_KILLFOCUS, 0, 0);
+            let f2 = focus_serial();
+            assert!(f2 > f1);
+            assert!(!client_cursor().unwrap().2);
+
+            wm::SetPropW(hwnd, TITLE_PROC, title);
+            if !child.is_null() {
+                wm::DestroyWindow(child);
+            }
+            wm::DestroyWindow(hwnd);
+        }
+        assert_eq!(title_hwnd(), 0);
+        let seen = RECORDED_MESSAGES.with(|m| m.borrow().clone());
+        assert!(seen.iter().any(|(m, _)| *m == wm::WM_MOUSEMOVE));
+        assert!(seen.iter().any(|(m, _)| *m == wm::WM_MOUSEWHEEL));
+        assert!(seen.iter().any(|(m, _)| *m == wm::WM_ENTERSIZEMOVE));
+    }
+
+    #[test]
+    fn window_proc_setcursor_handles_htclient_and_htcaption() {
+        let _guard = CURSOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(should_hide_os_cursor_with(false, true, true));
+        assert!(should_hide_os_cursor_with(false, false, false));
+        assert!(!should_hide_os_cursor_with(false, false, true));
+        assert!(!should_hide_os_cursor_with(true, true, true));
+        assert!(!should_hide_os_cursor_with(true, false, false));
+
+        if std::env::var_os("VICTORY_CURSOR_OS").is_some_and(|v| v == "1") {
+            return;
+        }
+
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("cursor-test"),
+            0,
+            0,
+            0,
+            40,
+            40,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+
+        // SAFETY: `hwnd` is owned by this thread; original title proc restored before destroy.
+        unsafe {
+            let title = wm::GetPropW(hwnd, TITLE_PROC);
+            wm::SetPropW(hwnd, TITLE_PROC, record_messages as *const () as *mut c_void);
+
+            // Cursor mode visible -> HTCLIENT intercepted (returns 1), HTCAPTION forwarded (returns 42).
+            set_cursor_ui_state(true, true);
+            RECORDED_MESSAGES.with(|m| m.borrow_mut().clear());
+            assert_eq!(wm::SendMessageW(hwnd, wm::WM_SETCURSOR, hwnd as usize, wm::HTCLIENT as LPARAM), 1);
+            assert_eq!(wm::SendMessageW(hwnd, wm::WM_SETCURSOR, hwnd as usize, wm::HTCAPTION as LPARAM), 42);
+            let seen = RECORDED_MESSAGES.with(|m| m.borrow().clone());
+            assert_eq!(seen, [(wm::WM_SETCURSOR, wm::HTCAPTION as LPARAM)]);
+
+            // Camera-look mode (!cursor_mode) -> HTCLIENT intercepted (returns 1).
+            set_cursor_ui_state(false, false);
+            assert_eq!(wm::SendMessageW(hwnd, wm::WM_SETCURSOR, hwnd as usize, wm::HTCLIENT as LPARAM), 1);
+
+            // Cursor mode with swapchain cursor hidden -> HTCLIENT forwarded to title/OS.
+            set_cursor_ui_state(false, true);
+            assert_eq!(wm::SendMessageW(hwnd, wm::WM_SETCURSOR, hwnd as usize, wm::HTCLIENT as LPARAM), 42);
+
+            wm::SetPropW(hwnd, TITLE_PROC, title);
+            wm::DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn window_proc_bridges_keydown_keyup_and_clears_on_killfocus() {
+        let _guard = CURSOR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_window_keys();
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("key-bridge-test"),
+            0,
+            0,
+            0,
+            40,
+            40,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+
+        // SAFETY: `hwnd` is owned by this thread; original title proc restored before destroy.
+        unsafe {
+            let title = wm::GetPropW(hwnd, TITLE_PROC);
+            wm::SetPropW(hwnd, TITLE_PROC, record_messages as *const () as *mut c_void);
+
+            wm::SendMessageW(hwnd, wm::WM_KEYDOWN, 0x0D, 0x001C_0001);
+            wm::SendMessageW(hwnd, wm::WM_SYSKEYDOWN, 0x10, 0);
+            assert_eq!(window_keys(), vec![0x0D, 0xA0]);
+
+            wm::SendMessageW(hwnd, wm::WM_KEYUP, 0x0D, 0xC01C_0001);
+            assert_eq!(window_keys(), vec![0xA0]);
+
+            wm::SendMessageW(hwnd, wm::WM_KILLFOCUS, 0, 0);
+            assert!(window_keys().is_empty());
+
+            wm::SetPropW(hwnd, TITLE_PROC, title);
+            wm::DestroyWindow(hwnd);
+        }
     }
 }

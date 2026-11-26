@@ -68,27 +68,9 @@ pub(crate) fn sky_drawn(image: usize) {
     }
 }
 
-/// Sky-dome exposure curve (`VICTORY_AMBIENT_SKY=gain,least,power`, default
-/// `0.36,0.03,0.42`, calibrated after Belobug e48eb83e/4f62c2a5 so real sun
-/// and interior shadows keep crisp contrast; set `off` to disable sky tracking).
-fn sky_follow() -> Option<[f32; 3]> {
-    static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_SKY").unwrap_or_default();
-        if set.trim().eq_ignore_ascii_case("off") || set.trim() == "0" {
-            return None;
-        }
-        let mut follow = [0.36f32, 0.03, 0.42];
-        for (to, v) in follow.iter_mut().zip(set.split(',')) {
-            if let Ok(v) = v.trim().parse::<f32>()
-                && v.is_finite()
-                && v >= 0.0
-            {
-                *to = v;
-            }
-        }
-        Some(follow)
-    })
+/// Sky-dome exposure curve from the live graphics module (or `None` if disabled).
+fn sky_follow(g: &crate::graphics::Settings) -> Option<[f32; 3]> {
+    g.sky_enabled.then_some([g.sky_gain, g.sky_least, g.sky_power])
 }
 
 /// Programs of the title the stand-in follows.
@@ -133,6 +115,7 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// Where `CS_UpdateHistory` writes reflections (R9G9B9E5 as R32_UINT).
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
     Off,
@@ -140,6 +123,7 @@ enum Set {
     Constant(f32),
 }
 
+#[cfg(test)]
 fn parse(set: &str) -> Set {
     let set = set.trim();
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
@@ -147,11 +131,6 @@ fn parse(set: &str) -> Set {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
         None => number(set).map_or(Set::Off, Set::Estimate),
     }
-}
-
-fn set() -> Set {
-    static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
 /// Opt-in hybrid mode (`VICTORY_AMBIENT_WITH_RT=1`): allow subtle ambient
@@ -162,92 +141,14 @@ fn with_rt() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_WITH_RT").is_some_and(|v| v == "1"))
 }
 
-/// Whether the stand-in is on: set, and either the builder is off or
-/// hybrid `VICTORY_AMBIENT_WITH_RT=1` is enabled.
+/// Whether the stand-in is on: enabled in [`crate::graphics`], and either the
+/// RT structure builder is off or hybrid `VICTORY_AMBIENT_WITH_RT=1` is active.
 pub(crate) fn on() -> bool {
-    set() != Set::Off && (!crate::pipeline::builder_runs() || with_rt())
-}
-
-/// The most the air scatters, as a multiple of the light around
-/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
-fn air() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
-    })
-}
-
-/// Soft-knee reflection compression threshold as a multiple of surrounding
-/// ambient light (`VICTORY_AMBIENT_REFLECT=<knee>`, default `0.85`; `0` leaves
-/// reflections untouched) and subtle minimum reflection floor
-/// (`VICTORY_AMBIENT_REFLECT_FLOOR=<min>`, default `0.07`, after Belobug
-/// c3bd5612). Keeps eyes and glossy indoor surfaces free of unoccluded white
-/// sky glaze while preserving crisp SSR reflections on counters/glass/metal.
-fn reflect_bounds() -> (f32, f32) {
-    static SET: OnceLock<(f32, f32)> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let cap = std::env::var("VICTORY_AMBIENT_REFLECT")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.85);
-        let floor = std::env::var("VICTORY_AMBIENT_REFLECT_FLOOR")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.07);
-        (cap, floor)
-    })
-}
-
-/// Maximum ratio of the title's own probe output to keep over our directional
-/// estimate (`VICTORY_AMBIENT_MOST=<ratio>`, default `0.0`: overwrite cleanly
-/// so uninitialized screen-probe sky blocks never create a white glare box on
-/// characters in indoor cutscenes).
-fn most_keep() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        std::env::var("VICTORY_AMBIENT_MOST")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
-    })
-}
-
-/// Minimum scene-tinted diffuse floor (`VICTORY_AMBIENT_FLOOR=<level>`,
-/// default `0.04`; `0` disables the floor). Subtle enough to preserve rich
-/// colored bounce lighting and dark AO crevices while keeping shadowed indoor
-/// corners readable.
-fn ambient_floor() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        std::env::var("VICTORY_AMBIENT_FLOOR")
-            .ok()
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.04)
-    })
-}
-
-/// Strength and radius of dual-scale contact + architectural GTAO/SSAO.
-fn shade() -> [f32; 2] {
-    static SET: OnceLock<[f32; 2]> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let mut shade = [1.35, 0.80];
-        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
-        for (to, v) in shade.iter_mut().zip(set.split(',')) {
-            if let Ok(v) = v.trim().parse() {
-                *to = v;
-            }
-        }
-        shade
-    })
+    crate::graphics::current().ambient_enabled && (!crate::pipeline::builder_runs() || with_rt())
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -257,6 +158,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float reflect_floor;
+    uint ao_taps; uint contact_steps; uint gather_step; float ceiling_floor;
 };
 Texture2D<float> depth : register(t0);
 // Cells:
@@ -340,7 +242,8 @@ void gather(uint3 at : SV_DispatchThreadID) {
     float r2 = 0.10 + 0.0014 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
+    uint step = max(gather_step, 1u);
+    for (uint i = 0; i < CELLS; i += step) {
         float4 c = cells[CELLS + 1 + i];
         float3 nc = cells[2 * CELLS + 1 + i].xyz;
         float3 L = cells[i].rgb;
@@ -411,22 +314,22 @@ void raise(uint3 at : SV_DispatchThreadID) {
     int2 p = int2(at.xy);
     float3 c = seen(p, size);
     float3 n = surface_normal(p, size, c);
-    // Dual-scale GTAO / contact + architectural corner AO + bent normal.
+    // Configurable dual-scale GTAO / contact + architectural corner AO + bent normal.
     float open = 1.0;
     float3 bent_n = n;
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
-    if (strength > 0.0 && c.z < 350.0) {
+    if (strength > 0.0 && ao_taps > 0u && c.z < 350.0) {
         float px_base = radius * size.y / (2.0 * tan_y * c.z);
         float3 bent = float3(0.0, 0.0, 0.0);
-        // Scale 1: Tight contact AO (faces, collars, props, chair legs, window bars).
+        // Scale 1: Tight contact AO (4 or 8 taps depending on graphics preset).
         float r_tight = max(radius * 0.35, 0.14);
         float px_tight = min(px_base * 0.35, 36.0);
         float sum_tight = 0.0;
-        if (px_tight >= 1.25) {
-            const int NT = 8;
-            for (int i = 0; i < NT; i++) {
+        int nt = int(min(ao_taps, 8u));
+        if (px_tight >= 1.25 && nt > 0) {
+            for (int i = 0; i < nt; i++) {
                 float a = i * 2.399963 + noise * 6.2831853;
-                float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / NT) * px_tight);
+                float2 o = float2(cos(a), sin(a)) * (sqrt((float(i) + 0.5) / float(nt)) * px_tight);
                 float3 v = seen(p + int2(round(o)), size) - c;
                 float vv = dot(v, v);
                 float inv_d = rsqrt(vv + 1e-6);
@@ -436,18 +339,17 @@ void raise(uint3 at : SV_DispatchThreadID) {
                 sum_tight += occ;
                 bent += (v * inv_d) * (1.0 - occ);
             }
-            sum_tight /= NT;
+            sum_tight /= float(nt);
         }
-        // Scale 2: Medium architectural corner AO (booths, wall-floor seams, ceiling corners)
-        // without over-darkening open walls inside small rooms like prison cells.
+        // Scale 2: Medium architectural corner AO (only when ao_taps > 8, e.g. Cinema preset).
         float r_wide = radius * 1.15;
         float px_wide = min(px_base * 1.15, 110.0);
         float sum_wide = 0.0;
-        if (px_wide >= 2.0) {
-            const int NW = 12;
-            for (int i = 0; i < NW; i++) {
+        int nw = ao_taps > 8u ? int(min(ao_taps - 8u, 12u)) : 0;
+        if (px_wide >= 2.0 && nw > 0) {
+            for (int i = 0; i < nw; i++) {
                 float a = (i + 8) * 2.399963 + noise * 6.2831853;
-                float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / NW) * px_wide);
+                float2 o = float2(cos(a), sin(a)) * (sqrt((float(i) + 0.5) / float(nw)) * px_wide);
                 float3 v = seen(p + int2(round(o)), size) - c;
                 float vv = dot(v, v);
                 float inv_d = rsqrt(vv + 1e-6);
@@ -457,16 +359,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
                 sum_wide += occ;
                 bent += (v * inv_d) * (1.0 - occ);
             }
-            sum_wide /= NW;
+            sum_wide /= float(nw);
         }
         float ao_tight = saturate(1.0 - strength * 1.75 * sum_tight);
-        float ao_wide  = saturate(1.0 - strength * 1.65 * sum_wide);
+        float ao_wide  = nw > 0 ? saturate(1.0 - strength * 1.65 * sum_wide) : ao_tight;
         float dist_fade = saturate(1.0 - (c.z - 220.0) / 130.0);
-        // Deep physical multi-bounce AO (floor 0.09) so under-bunk cavities,
-        // shelf undersides, chair legs, and chin/collar creases hold crisp shadows.
+        // Protect downward-facing indoor ceilings from harsh AO corner crush.
+        float ao_floor = n.y < -0.55 ? 0.34 : 0.11;
         float raw_ao = saturate(ao_tight * 0.55 + ao_wide * 0.45);
         float ao_shaped = pow(raw_ao, 1.15);
-        open = lerp(1.0, lerp(0.09, 1.0, ao_shaped), dist_fade);
+        open = lerp(1.0, lerp(ao_floor, 1.0, ao_shaped), dist_fade);
         bent_n = normalize(n + bent * (0.045 * dist_fade));
     }
     float3 found;
@@ -475,35 +377,43 @@ void raise(uint3 at : SV_DispatchThreadID) {
         light[p] = pack(found);
         return;
     }
-    // Between the four points around, those at its own depth first; which
-    // four is dithered a little.
-    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
-    int2 g0 = int2(floor(g));
-    float2 f = g - float2(g0);
-    float4 sr = 0, sg = 0, sb = 0;
-    float sum = 0;
-    for (int k = 0; k < 4; k++) {
-        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
-        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-        uint at0 = (q.y * PX + q.x) * 3;
-        sr += w * points[at0];
-        sg += w * points[at0 + 1];
-        sb += w * points[at0 + 2];
-        sum += w;
+    float3 all;
+    float3 dir_sh;
+    float3 sh_vec = float3(0.0, 0.0, 0.0);
+    if (gather_step == 0u) {
+        // Minimal preset: fast sky/room-mean fill without SH1 point lookups.
+        all = max(cells[CELLS].rgb, float3(0.02, 0.02, 0.02));
+        dir_sh = all;
+    } else {
+        // Between the four points around, those at its own depth first; which
+        // four is dithered a little.
+        float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+        int2 g0 = int2(floor(g));
+        float2 f = g - float2(g0);
+        float4 sr = 0, sg = 0, sb = 0;
+        float sum = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+            float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+            uint at0 = (q.y * PX + q.x) * 3;
+            sr += w * points[at0];
+            sg += w * points[at0 + 1];
+            sb += w * points[at0 + 2];
+            sum += w;
+        }
+        all = float3(sr.w, sg.w, sb.w) / sum;
+        // Directional SH1 bounce evaluated along bent normal for grounded colored bounce.
+        dir_sh = all + 1.55 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
+        dir_sh = clamp(dir_sh, 0.18 * all, 2.8 * all);
+        sh_vec = (sr.xyz * LUMA.r + sg.xyz * LUMA.g + sb.xyz * LUMA.b) / sum;
     }
-    float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    // Directional SH1 bounce evaluated along bent normal for grounded colored bounce.
-    float3 dir_sh = all + 1.55 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
-    dir_sh = clamp(dir_sh, 0.12 * all, 2.8 * all);
-    float3 bounce = lerp(dir_sh, cells[CELLS].rgb, 0.08) * level;
-    // Screen-space directional contact shadows along dominant SH1 incoming light
-    // (windows / ceiling lamps) so bunks, shelves, tables, chairs, and collars
-    // cast grounded shadows without foreground depth-jump halos.
+    float3 bounce = lerp(dir_sh, cells[CELLS].rgb, 0.12) * level;
+    // Screen-space directional contact shadows (configurable steps; disabled on
+    // downward-facing ceilings n.y <= -0.55 so ceilings never self-shadow black).
     float dir_shadow = 1.0;
-    if (strength > 0.0 && c.z < 120.0) {
-        float3 sh_vec = (sr.xyz * LUMA.r + sg.xyz * LUMA.g + sb.xyz * LUMA.b) / sum;
+    if (strength > 0.0 && contact_steps > 0u && n.y > -0.55 && c.z < 120.0) {
         float sh_len = length(sh_vec);
         float3 up_bias = float3(0.0, 0.78, -0.32);
         float3 l_dir = sh_len > 1e-4 ? (sh_vec / sh_len) : up_bias;
@@ -512,9 +422,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float occ_max = 0.0;
         float max_reach = min(radius * 1.35, 1.15);
         float thick = max(0.04, 0.018 * c.z);
-        const int NS = 8;
-        for (int s = 0; s < NS; s++) {
-            float frac_s = (float(s) + 0.35 + 0.65 * noise) / float(NS);
+        int ns = int(min(contact_steps, 8u));
+        for (int s = 0; s < ns; s++) {
+            float frac_s = (float(s) + 0.35 + 0.65 * noise) / float(ns);
             float dist_m = max_reach * (frac_s * frac_s);
             float3 sp = c + ray_dir * dist_m;
             if (sp.z <= near) break;
@@ -529,28 +439,28 @@ void raise(uint3 at : SV_DispatchThreadID) {
             }
         }
         float s_fade = saturate(1.0 - (c.z - 60.0) / 60.0);
-        dir_shadow = lerp(1.0, lerp(1.0, 0.28, occ_max * saturate(strength * 0.75)), s_fade);
+        dir_shadow = lerp(1.0, lerp(1.0, 0.32, occ_max * saturate(strength * 0.75)), s_fade);
     }
     float4 sky_entry = cells[3 * CELLS + 1];
+    float hemi_floor = clamp(ceiling_floor, 0.36, 0.85);
     if (sky_entry.a > 0.0) {
-        // Calibrated sky-dome indirect floor modulated by directional SH1 ratio,
-        // hemisphere normal orientation (undersides stay dark), and distance fade
-        // so GTA VI's 2048x8192 sun shadow map keeps crisp outdoor shadow contrast.
+        // Calibrated sky-dome indirect floor with lifted ceiling hemisphere so
+        // indoor ceilings stay illuminated while sun shadows stay crisp outdoors.
         float all_luma = max(dot(all, LUMA), 1e-4);
-        float3 dir_ratio = clamp(dir_sh / all_luma, 0.40, 1.90);
-        float3 room_avg = max(cells[CELLS].rgb, float3(0.005, 0.0049, 0.0047));
-        float room_luma = max(dot(room_avg, LUMA), 0.005);
+        float3 dir_ratio = clamp(dir_sh / all_luma, 0.45, 1.90);
+        float3 room_avg = max(cells[CELLS].rgb, float3(0.008, 0.0078, 0.0075));
+        float room_luma = max(dot(room_avg, LUMA), 0.008);
         float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.55, 1.55), 0.42);
-        float hemi = lerp(0.36, 1.0, saturate(bent_n.y * 0.5 + 0.5));
-        float indoor_fill = lerp(1.0, 0.45, saturate((c.z - 12.0) / 18.0));
-        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.65)
+        float hemi = lerp(hemi_floor, 1.0, saturate(bent_n.y * 0.5 + 0.5));
+        float indoor_fill = lerp(1.0, 0.48, saturate((c.z - 12.0) / 18.0));
+        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.60)
             * hemi * indoor_fill * max(level, 0.65);
         bounce = max(bounce, sky_fill);
     } else if (reflect_floor > 0.0) {
-        float3 room_avg = max(cells[CELLS].rgb, float3(0.01, 0.0098, 0.0094));
-        float room_luma = max(dot(room_avg, LUMA), 0.01);
+        float3 room_avg = max(cells[CELLS].rgb, float3(0.012, 0.0118, 0.0112));
+        float room_luma = max(dot(room_avg, LUMA), 0.012);
         float3 room_tint = lerp(float3(1.0, 0.98, 0.94), clamp(room_avg / room_luma, 0.4, 1.8), 0.55);
-        float hemi = lerp(0.40, 1.0, saturate(bent_n.y * 0.5 + 0.5));
+        float hemi = lerp(hemi_floor, 1.0, saturate(bent_n.y * 0.5 + 0.5));
         bounce = max(bounce, room_tint * reflect_floor * hemi);
     }
     found = bounce * open * dir_shadow;
@@ -785,8 +695,8 @@ pub(crate) struct Views {
 
 /// Samples the title's sky dome (`ps_sky_paraboloid_reflection`) into
 /// `cells[3 * CELLS + 1]` and restores the list's descriptor heaps.
-fn update_sky(list: &HostList, pass: &Pass, views: &Views) {
-    let Some([gain, least, power]) = sky_follow() else {
+fn update_sky(list: &HostList, pass: &Pass, views: &Views, g: &crate::graphics::Settings) {
+    let Some([gain, least, power]) = sky_follow(g) else {
         return;
     };
     let Some(sky_copy) = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
@@ -863,19 +773,25 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
-        Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
+    let g = crate::graphics::current();
+    if !g.ambient_enabled {
+        return false;
+    }
+    let (level, constant) = if g.ambient_constant > 0.0 {
+        (0.0f32, g.ambient_constant)
+    } else if g.ambient_level > 0.0 {
+        (g.ambient_level, 0.0f32)
+    } else {
+        return false;
     };
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && (constant > 0.0 || g.air_cap <= 0.0 || g.gather_step == 0) {
         return false;
     }
-    let (reflect_cap, reflect_floor) = reflect_bounds();
-    if role == Role::Reflect && reflect_cap == 0.0 && reflect_floor == 0.0 {
+    let (reflect_cap, reflect_floor) = (g.reflect_cap, g.reflect_floor);
+    if role == Role::Reflect && reflect_cap <= 0.0 && reflect_floor <= 0.0 {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -883,26 +799,39 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 4 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            tracing::info!(
+                ?role,
+                preset = g.preset.name(),
+                size = ?views.size,
+                level,
+                constant,
+                ao_taps = g.ao_taps,
+                contact_steps = g.contact_steps,
+                gather_step = g.gather_step,
+                "a stand-in for the indirect light"
+            );
         }
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
     if role == Role::Resolve && constant == 0.0 {
-        update_sky(list, pass, views);
+        update_sky(list, pass, views, &g);
     }
-    let [strength, radius] = shade();
-    let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let floats = [level, constant, g.ao_strength, g.ao_radius, 0.1, 0.45];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = most_keep().to_bits();
-    words[10] = if role == Role::Reflect { reflect_cap } else { air() }.to_bits();
-    words[11] = if role == Role::Resolve { ambient_floor() } else { reflect_floor }.to_bits();
+    words[9] = g.ambient_most.to_bits();
+    words[10] = if role == Role::Reflect { reflect_cap } else { g.air_cap }.to_bits();
+    words[11] = if role == Role::Resolve { g.ambient_floor } else { reflect_floor }.to_bits();
+    words[12] = g.ao_taps;
+    words[13] = g.contact_steps;
+    words[14] = g.gather_step;
+    words[15] = g.ceiling_floor.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -910,7 +839,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -929,7 +858,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
-                if constant == 0.0 {
+                if constant == 0.0 && g.gather_step > 0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }

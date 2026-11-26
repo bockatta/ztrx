@@ -30,8 +30,8 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
-/// The same while the card has room ([`room`]): 4 GiB of them.
-const SPARE_KEPT: usize = 64;
+/// The same while the card has room ([`room`]): 512 MiB of them.
+const SPARE_KEPT: usize = 8;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
@@ -42,7 +42,14 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let most = spares(memory, crate::host::keep_freed());
+    SPARES.store(most, Ordering::Relaxed);
+    if on() {
+        let mut textures = lock(&TEXTURES);
+        if textures.blocks() > most {
+            textures.rested(now());
+        }
+    }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -64,6 +71,14 @@ fn now() -> u64 {
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Whether staging buffers (PC RAM only, capped at `STAGING_KEPT` blocks)
+/// are pooled independently of `VICTORY_TEXTURE_POOL` (`VICTORY_STAGING_POOL`,
+/// on by default unless `"0"`).
+pub(crate) fn staging_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -343,7 +358,7 @@ impl Drop for StagingPiece {
 /// `bytes` of upload memory, all zeros: the buffer it lies in, where in
 /// that buffer, and its mapping. `None`: not pooled.
 pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPiece, ID3D12Resource, u64, *mut u8)> {
-    if !on() {
+    if !staging_on() {
         return None;
     }
     // Copies from a buffer begin at multiples of 512.
