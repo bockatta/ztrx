@@ -3762,6 +3762,44 @@ fn buffer_uav(
 /// typed resource's. A view of a typed texture in another format of its
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
+/// Whether the host GPU supports typed UAV stores in DXGI format `format`
+/// (cached per format; Marvisak #2462 prevents NVIDIA Win10 device removal
+/// on formats like B5G5R5A1_UNORM).
+fn typed_store(format: u32) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0 = unknown, 1 = unsupported, 2 = supported
+    static CACHE: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    let idx = format as usize;
+    if idx < CACHE.len() {
+        match CACHE[idx].load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    let Some(host) = host() else {
+        return true;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: valid CheckFeatureSupport query on live device.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+        )
+    }
+    .is_ok()
+        && (support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0) != 0;
+    if idx < CACHE.len() {
+        CACHE[idx].store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+    }
+    ok
+}
+
 /// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
@@ -3796,6 +3834,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Marvisak #2462: a typed unordered view in a format the host cannot store
+    // to (e.g. B5G5R5A1_UNORM on NVIDIA) removes the device when made.
+    let typed = if view == 0 || !typeless { own } else { view };
+    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
+        once!(view = typed, own, "an unordered view in a format the host cannot store");
+        return false;
+    }
     if view == 0 {
         return !typeless;
     }
@@ -4422,20 +4467,31 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use). Placed UAVs (2D, array and 3D) get a host UAV texture recorded in
+/// `TARGETS_AT`, and placed SRVs clear target flags so they never overwrite
+/// that alias (ported from VItoriaBr b6e61ab #72).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    let &View::Placed(unordered, mut resource, ref desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    if unordered {
+        let texture = crate::resource::uav_texture_at(address, &resource, desc[0])?;
+        Some(View::Unordered(texture as usize, 0, words))
+    } else {
+        resource[12] &= !TARGET_DEPTH_UNORDERED;
+        let texture = crate::resource::texture_at(address, &resource)?;
+        crate::resource::want_level(texture, crate::resource::first_mip(desc));
+        Some(View::Shader(texture as usize, words))
+    }
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

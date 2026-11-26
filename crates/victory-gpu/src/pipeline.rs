@@ -64,6 +64,10 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// True for `CS_ScreenProbes_ActivateRays`, which destroys light, shadows,
+    /// and reflections when run without ray tracing (Belobug 6986a571).
+    #[cfg(windows)]
+    pub(crate) probe_rays: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -116,6 +120,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                probe_rays: stage == "compute"
+                    && bytes
+                        .windows(b"CS_ScreenProbes_ActivateRays".len())
+                        .any(|w| w == b"CS_ScreenProbes_ActivateRays"),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -308,6 +317,19 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
+}
+
+/// Whether `this` is `CS_ScreenProbes_ActivateRays` and should be skipped
+/// while the ray-tracing structure builder is off (Belobug 6986a571: running
+/// it with no rays behind it destroys light, shadows, and reflections).
+/// Set `VICTORY_RUN_PROBE_RAYS=1` to force it to run.
+#[cfg(windows)]
+pub(crate) fn is_idle_probe_rays(this: This) -> bool {
+    static FORCE_RUN: OnceLock<bool> = OnceLock::new();
+    if *FORCE_RUN.get_or_init(|| std::env::var_os("VICTORY_RUN_PROBE_RAYS").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    !this.is_null() && !builder_runs() && pipeline(this).shaders.iter().any(|s| s.probe_rays)
 }
 
 /// A stage of the builder was dropped after all: none runs for the rest of

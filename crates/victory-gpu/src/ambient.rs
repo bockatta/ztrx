@@ -51,6 +51,9 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes the title's reflections (`CS_UpdateHistory`, Belobug c3bd5612):
+    /// without rays, glossy surfaces indoors get an unoccluded sky glare.
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +65,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -75,6 +80,8 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where `CS_UpdateHistory` writes reflections (R9G9B9E5 as R32_UINT).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -112,6 +119,28 @@ fn air() -> f32 {
     })
 }
 
+/// Maximum reflection brightness as a multiple of surrounding ambient light
+/// (`VICTORY_AMBIENT_REFLECT=<cap>`, default `0.65`; `0` leaves reflections
+/// untouched) and optional floor (`VICTORY_AMBIENT_REFLECT_FLOOR=<min>`,
+/// default `0.0`). Prevents unoccluded sky white-glaze on indoor glossy
+/// surfaces when rays are off (after Belobug c3bd5612).
+fn reflect_bounds() -> (f32, f32) {
+    static SET: OnceLock<(f32, f32)> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let cap = std::env::var("VICTORY_AMBIENT_REFLECT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.65);
+        let floor = std::env::var("VICTORY_AMBIENT_REFLECT_FLOOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0);
+        (cap, floor)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -137,7 +166,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float reflect_floor;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -329,6 +358,40 @@ void raise(uint3 at : SV_DispatchThreadID) {
     light[p] = pack(max(was, found));
 }
 #endif
+
+#ifdef REFLECT
+RWTexture2D<uint> reflected : register(u0);
+float3 unpack_r(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack_r(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void clamp_reflect(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    int2 p = int2(at.xy);
+    float3 c = unpack_r(reflected[p]);
+    float3 base = constant > 0.0 ? float3(1.0, 0.98, 0.94) * constant : cells[CELLS].rgb * level;
+    float base_luma = max(dot(base, LUMA), 0.02);
+    float has = dot(c, LUMA);
+    if (air > 0.0) {
+        float cap = air * base_luma;
+        if (has > cap) c *= cap / max(has, 1e-6);
+    }
+    if (reflect_floor > 0.0) {
+        c = max(c, base * reflect_floor);
+    }
+    reflected[p] = pack_r(c);
+}
+#endif
 "#;
 
 /// Bytes of the cells' buffer and of the points'.
@@ -344,6 +407,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    reflect: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -375,6 +439,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let reflect = pipeline("REFLECT", s!("clamp_reflect"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -384,6 +449,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        reflect,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -440,6 +506,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
+    let (reflect_cap, reflect_floor) = reflect_bounds();
+    if role == Role::Reflect && reflect_cap == 0.0 && reflect_floor == 0.0 {
+        return false;
+    }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -460,7 +530,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
-    words[10] = air().to_bits();
+    words[10] = if role == Role::Reflect { reflect_cap } else { air() }.to_bits();
+    words[11] = reflect_floor.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -485,6 +556,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);

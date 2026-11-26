@@ -2214,6 +2214,10 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Interface pointers already in `kept`, so repeated binds of the same
+    /// heap or staging buffer do not accumulate thousands of redundant COM
+    /// `AddRef`/`Release` pairs per list reset (Pavl3000/victory-speed ee0338a6).
+    kept_seen: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -3626,7 +3630,6 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 mod send;
@@ -7085,10 +7088,17 @@ impl HostList {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
     }
 
-    /// Keeps `object` alive until the list is reset.
+    /// Keeps `object` alive until the list is reset. Each interface pointer is
+    /// added at most once per recording to avoid thousands of duplicate COM
+    /// `AddRef`/`Release` calls on reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
+        let key = object.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.kept_seen.insert(key) {
+            return;
+        }
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+            deferred.kept.push(object);
         }
     }
 
@@ -8480,7 +8490,6 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
 
@@ -8512,7 +8521,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -8909,13 +8917,12 @@ impl Host {
             list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, laid.as_ref().unwrap_or(texture)))
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
             let watched = crate::popwatch::take(&self.device, list, texture);
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -8954,7 +8961,6 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
             p.meter.frame(p.hwnd);
             showing.end();
@@ -9008,7 +9014,6 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })
         }

@@ -179,7 +179,13 @@ fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
 fn window_limit() -> Option<(i32, i32)> {
     static LIMIT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        let value = std::env::var_os("VICTORY_WINDOW_MAX")?;
+        let Some(value) = std::env::var_os("VICTORY_WINDOW_MAX") else {
+            // Default to a clean <=1920x1080 centered window (never overflows a 1440p monitor).
+            return Some((1920, 1080));
+        };
+        if value.to_str().is_some_and(|s| matches!(s.trim(), "0" | "off" | "none")) {
+            return None;
+        }
         let parsed = value.to_str().and_then(parse_window_limit);
         if parsed.is_none() {
             tracing::warn!(
