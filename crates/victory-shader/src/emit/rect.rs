@@ -87,6 +87,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         };
         e.usage = (1 << e.cols) - 1;
     }
+    super::container::one_mode_per_register(&mut outputs, false);
     let mut s = Shader::new(false);
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,
@@ -406,6 +407,7 @@ mod tests {
             s.m.terminate(b, Term::Ret);
         }
         let host = |stage, s: Shader| super::super::HostShader {
+            dispatch_x_one: false,
             stage,
             dxil: s.finish(),
             user_data: Vec::new(),

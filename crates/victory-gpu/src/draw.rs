@@ -2645,6 +2645,11 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if p.dispatch_x_one() && x > 1 && y > 0 && z > 0 {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            once!(x, y, z, "dispatch dropped: translated shader requires group count X = 1");
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3738,6 +3743,13 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
+        if kind == DISPATCH && p.dispatch_x_one() {
+            if max > 0 {
+                why("translated shader requires group count X = 1; indirect counts are unknown");
+                return false;
+            }
+            return true;
+        }
         // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
@@ -3929,6 +3941,13 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

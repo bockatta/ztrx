@@ -80,13 +80,23 @@ struct OwnedPatch {
 }
 
 /// The upscaler choice: `mov eax, 6` (own upscaler) then `cmovne eax, ecx`
-/// (FSR when the profile asks for it). NOPing the cmovne keeps 6.
-const OWN_UPSCALER: Patch<'static> = Patch {
-    what: "upscaler: always the title's own",
-    rva: 0x7e9426,
-    expect: &[0x0F, 0x45, 0xC1],
-    new: &[0x0F, 0x1F, 0x00],
-};
+/// (FSR when the profile asks for it). NOPing the cmovne keeps 6, and the
+/// per-frame copy at +0x5400190 returns 6 (`mov eax, 6; ret`) so Series S
+/// never mixes FSR 4 with type-6 upscaling.
+const OWN_UPSCALER: &[Patch<'static>] = &[
+    Patch {
+        what: "upscaler: always the title's own",
+        rva: 0x7e9426,
+        expect: &[0x0F, 0x45, 0xC1],
+        new: &[0x0F, 0x1F, 0x00],
+    },
+    Patch {
+        what: "upscaler: per-frame copy always returns 6",
+        rva: 0x540_0190,
+        expect: &[0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B],
+        new: &[0xB8, 0x06, 0x00, 0x00, 0x00, 0xC3],
+    },
+];
 
 /// Read-only float constants of this build usable as the FSR scale:
 /// value, RVA.
@@ -175,8 +185,10 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     }
     let mut applied = 0;
     if own {
-        // SAFETY: forwarded from this function's contract.
-        applied += usize::from(unsafe { apply(base, &OWN_UPSCALER) });
+        for p in OWN_UPSCALER {
+            // SAFETY: forwarded from this function's contract.
+            applied += usize::from(unsafe { apply(base, p) });
+        }
     }
     if let Some(text) = scale {
         match parse_scale(&text) {

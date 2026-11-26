@@ -29,6 +29,8 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Lightweight scripted input only (`VICTORY_KEYS`), for release FPS benchmarks.
+keys = ["victory-hle/keys"]
 
 [lints]
 workspace = true

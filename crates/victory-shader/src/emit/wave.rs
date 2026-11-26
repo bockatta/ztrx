@@ -37,22 +37,6 @@ pub(crate) enum Op {
 }
 
 impl Op {
-    /// The scalar operations a wave reduction combines its halves with (the two lanes read
-    /// with `v_readlane`). (Upstream VIctory a8bfe78.)
-    fn of_scalar(name: &str) -> Option<Op> {
-        Some(match name {
-            "s_add_u32" | "s_add_i32" => Op::AddU,
-            "s_min_u32" => Op::MinU,
-            "s_max_u32" => Op::MaxU,
-            "s_min_i32" => Op::MinI,
-            "s_max_i32" => Op::MaxI,
-            "s_and_b32" => Op::And,
-            "s_or_b32" => Op::Or,
-            "s_xor_b32" => Op::Xor,
-            _ => return None,
-        })
-    }
-
     fn of(name: &str) -> Option<Op> {
         Some(match name {
             // the low dword of a 64-bit sum (`v_add_co_ci_u32` carries into
@@ -128,15 +112,118 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
-    /// Low (`!high`) or high (`high`) 32 bits of the 64-bit float sum over
-    /// `lanes` of `mask ? f64(lo, hi) : 0.0`.
-    Red64F {
+    /// The low (`high` clear) or high dword of the 64-bit float sum (`v_add_f64`) over
+    /// `lanes` of `mask ? (lo, hi) : 0.0`, the double whose dwords are `lo` and `hi`.
+    Half64 {
+        high: bool,
         lo: Value,
         hi: Value,
         mask: Value,
         lanes: u64,
-        high: bool,
     },
+}
+
+/// Both dwords of a 64-bit float in one lane, as [`add64`] takes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pair {
+    /// +0.0, the sum's identity.
+    Zero,
+    /// The sum over `lanes` of `mask ? (lo, hi) : 0.0` (one lane's own value when `lanes` is
+    /// that lane).
+    Sum {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+    },
+}
+
+impl Pair {
+    /// The pair a lane's two dwords hold, if they are one.
+    fn of(lo: Sym, hi: Sym) -> Option<Pair> {
+        match (lo, hi) {
+            (Sym::K(0), Sym::K(0)) => Some(Pair::Zero),
+            // a lane's own masked value: both dwords picked by one mask, beside +0.0
+            (
+                Sym::Red {
+                    op: None,
+                    src: lo,
+                    mask,
+                    ident: 0,
+                    lanes,
+                },
+                Sym::Red {
+                    op: None,
+                    src: hi,
+                    mask: m,
+                    ident: 0,
+                    lanes: l,
+                },
+            ) if (mask, lanes) == (m, l) => Some(Pair::Sum { lo, hi, mask, lanes }),
+            (
+                Sym::Half64 {
+                    high: false,
+                    lo,
+                    hi,
+                    mask,
+                    lanes,
+                },
+                Sym::Half64 {
+                    high: true,
+                    lo: l2,
+                    hi: h2,
+                    mask: m2,
+                    lanes: n2,
+                },
+            ) if (lo, hi, mask, lanes) == (l2, h2, m2, n2) => Some(Pair::Sum { lo, hi, mask, lanes }),
+            _ => None,
+        }
+    }
+
+    /// The lane's two dwords.
+    fn syms(self) -> (Sym, Sym) {
+        match self {
+            Pair::Zero => (Sym::K(0), Sym::K(0)),
+            Pair::Sum { lo, hi, mask, lanes } => {
+                let half = |high| Sym::Half64 {
+                    high,
+                    lo,
+                    hi,
+                    mask,
+                    lanes,
+                };
+                (half(false), half(true))
+            }
+        }
+    }
+}
+
+/// The 64-bit float sum of two pairs: of the same terms over lanes that do not meet, or one
+/// of them +0.0.
+fn add64(a: Pair, b: Pair) -> Option<Pair> {
+    match (a, b) {
+        (Pair::Zero, x) | (x, Pair::Zero) => Some(x),
+        (
+            Pair::Sum {
+                lo,
+                hi,
+                mask,
+                lanes: la,
+            },
+            Pair::Sum {
+                lo: l2,
+                hi: h2,
+                mask: m2,
+                lanes: lb,
+            },
+        ) if (lo, hi, mask) == (l2, h2, m2) && la & lb == 0 => Some(Pair::Sum {
+            lo,
+            hi,
+            mask,
+            lanes: la | lb,
+        }),
+        _ => None,
+    }
 }
 
 /// What a value a section leaves holds in every lane.
@@ -148,21 +235,27 @@ pub(crate) enum Shape {
     Masked(Value, Value, u32),
     /// `op` over every lane.
     Active(Op, Value, Value, u32),
-    /// Low (`!high`) or high (`high`) 32 bits of the 64-bit float sum over every lane.
-    ActiveF64(Value, Value, Value, bool),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
+    /// The low (`high` clear) or high dword of the 64-bit float sum over every lane of the
+    /// lane's own `mask ? (lo, hi) : 0.0`.
+    Sum64 {
+        high: bool,
+        lo: Value,
+        hi: Value,
+        mask: Value,
+    },
 }
 
 /// The section starting at instruction `start` of a block: its restore
-/// index and the shapes of the values it writes.
+/// index and the shapes of the values it writes. The `v_readlane_b32`s of
+/// its values at constant lanes right after the restore (`end + 1` up to
+/// `after`) belong to it: they pick one lane of a partial result (lane 63
+/// of a wave64 reduction whose halves the code joined with lane 31's).
 pub(crate) struct Section {
     pub end: usize,
+    pub after: usize,
     pub shapes: HashMap<Value, Shape>,
-    /// What a `v_readlane_b32` of one lane takes, later in the block, from a
-    /// VGPR the section leaves (by the scalar it writes): the last lanes of
-    /// a reduction hold it before the first do.
-    pub reads: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
@@ -200,42 +293,19 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
-        let mut reads = HashMap::new();
-        for later in insts[end + 1..].iter().filter(|i| i.name() == "v_readlane_b32") {
-            if let Fields::Valu(v) = &later.fields
-                && let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
-                    (v.dst, &v.src[..])
-                && let Some(left) = later.read(Reg::V(*reg)).and_then(|x| vec.get(&x))
-                && let Some(w) = later.write(Reg::S(code))
-                && let Some(l) = lane_number(lane)
-                && let Some(&sym) = left.get(l as usize)
-                // (a lane's own value stays a lane read)
-                && !matches!(sym, Sym::Own(_))
-                && let Some(shape) = single(sym, wave)
-            {
-                reads.insert(w, shape);
-            }
+        let (vec, mut uni) = simulate(&insts[i + 1..end], wave, saved);
+        let mut after = end + 1;
+        while let Some(inst) = insts.get(after)
+            && let Some((w, lane)) = readlane(inst, &vec, wave)
+        {
+            uni.insert(w, lane);
+            after += 1;
         }
         let shapes = shapes(vec, uni, wave);
-        out.insert(i, Section { end, shapes, reads });
-        i = end + 1;
+        out.insert(i, Section { end, after, shapes });
+        i = after;
     }
     out
-}
-
-/// A scalar operand as the simulation has it: a uniform it followed, a constant, or the
-/// value itself.
-fn scalar_sym(inst: &Inst, op: &Operand, uni: &HashMap<Value, Sym>) -> Sym {
-    match *op {
-        Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
-            Some(x) => uni.get(&x).copied().unwrap_or(Sym::Uni(x)),
-            None => Sym::Unknown,
-        },
-        Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
-        Operand::Literal(x) => Sym::K(x),
-        _ => Sym::Unknown,
-    }
 }
 
 fn saved_code(inst: &Inst) -> u8 {
@@ -284,7 +354,8 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     match (a, b) {
-        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) => x,
+        // (a dword of a 64-bit sum is no 32-bit term: not even a float's identity keeps it)
+        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) && !matches!(x, Sym::Half64 { .. }) => x,
         (
             Sym::Red {
                 op: oa,
@@ -319,19 +390,35 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-/// The lane a `v_readlane_b32` names.
-fn lane_number(op: &Operand) -> Option<u32> {
-    match *op {
-        Operand::Const(c) => crate::resource::inline(c),
-        Operand::Literal(x) => Some(x),
-        _ => None,
+/// A `v_readlane_b32` at a constant lane of a value the section wrote:
+/// what it writes and that lane's value.
+fn readlane(inst: &Inst, vec: &HashMap<Value, Vec<Sym>>, wave: u32) -> Option<(Value, Sym)> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
     }
+    let (Some(Operand::Scalar { code, .. }), Some(&Operand::Vector { reg, .. }), Some(lane)) =
+        (v.dst, v.src.first(), v.src.get(1))
+    else {
+        return None;
+    };
+    let l = match *lane {
+        Operand::Const(c) => crate::resource::inline(c)?,
+        Operand::Literal(x) => x,
+        _ => return None,
+    };
+    let lanes = vec.get(&inst.read(Reg::V(reg))?)?;
+    let s = *lanes.get(l as usize).filter(|_| l < wave)?;
+    Some((inst.write(Reg::S(code))?, s))
 }
 
-/// The lanes' values of the VGPRs the section writes, and its scalars.
-type Left = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
+/// Each lane's value of the vector values the section writes, and the
+/// uniform values.
+type Simulated = (HashMap<Value, Vec<Sym>>, HashMap<Value, Sym>);
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Simulated {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -379,28 +466,39 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             {
                 masked.push(w);
             }
-            // A uniform copied, or two combined: the halves of a wave64 reduction read
-            // with `v_readlane` (lanes 0 and 32) and joined with `s_add_u32`, `s_min_u32`, ...
-            // (upstream VIctory a8bfe78).
-            let scalar = |k: usize| {
-                src.get(k)
-                    .map_or(Sym::Unknown, |o| scalar_sym(inst, o, &uni))
-            };
-            let result = match (name, Op::of_scalar(name)) {
-                ("s_mov_b32", _) => scalar(0),
-                (_, Some(op)) => combine(op, scalar(0), scalar(1)),
-                _ => Sym::Unknown,
-            };
-            let out = match dst {
-                Some(Operand::Scalar { code, .. }) if *code != NULL => inst.write(Reg::S(*code)),
-                _ => None,
-            };
-            for &(_, w) in &inst.writes {
-                if Some(w) == out {
-                    uni.insert(w, result);
-                } else {
-                    uni.entry(w).or_insert(Sym::Unknown);
+            // A scalar copied: what its source holds (a dword of a 64-bit sum read from a lane
+            // and moved to the register the code reads it from, `s_mov_b32 s20, s18` after
+            // `v_readlane_b32 s18, v2, 0`; a value from before the section; a constant).
+            if name == "s_mov_b32"
+                && let (Some(Operand::Scalar { code: dc, .. }), Some(s0)) = (dst, src.first())
+                && *dc != NULL
+                && let Some(w) = inst.write(Reg::S(*dc))
+            {
+                let sym = match *s0 {
+                    Operand::Scalar { code, .. } if code != NULL => inst
+                        .read(Reg::S(code))
+                        .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
+                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+                    Operand::Literal(x) => Sym::K(x),
+                    _ => Sym::Unknown,
+                };
+                uni.insert(w, sym);
+            }
+            // both dwords of a 64-bit sum moved at once
+            if name == "s_mov_b64"
+                && inst.reads.len() == inst.writes.len()
+                && inst
+                    .reads
+                    .iter()
+                    .all(|r| matches!(r.0, Reg::S(_)) && matches!(uni.get(&r.1), Some(Sym::Half64 { .. })))
+            {
+                for (w, r) in inst.writes.iter().zip(&inst.reads) {
+                    let s = uni[&r.1];
+                    uni.insert(w.1, s);
                 }
+            }
+            for &(_, w) in &inst.writes {
+                uni.entry(w).or_insert(Sym::Unknown);
             }
             continue;
         }
@@ -410,7 +508,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             }
             continue;
         };
-        let f16_inline = name == "v_add_f16";
         let lanes = |op: &Operand,
                      vec: &HashMap<Value, Vec<Sym>>,
                      uni: &HashMap<Value, Sym>|
@@ -429,7 +526,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     None => one(Sym::Unknown),
                 },
                 // Marvisak #2493: decode f16 inline float constants in v_add_f16.
-                Operand::Const(c @ 240..=248) if f16_inline => {
+                Operand::Const(c @ 240..=248) if name == "v_add_f16" => {
                     let h = [
                         0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
                     ][usize::from(c - 240)];
@@ -441,13 +538,61 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             }
         };
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        if name == "v_add_f64" {
+            // Each lane adds its two pairs of dwords; a sum the simulation does not follow
+            // leaves both dwords unknown.
+            let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
+                continue;
+            };
+            let pair = |op: Option<&Operand>| -> Vec<Option<Pair>> {
+                let (lo, hi) = match op {
+                    Some(&Operand::Vector { reg, .. }) => (
+                        lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni),
+                        lanes(&Operand::Vector { reg: reg + 1, dwords: 1 }, &vec, &uni),
+                    ),
+                    Some(&Operand::Scalar { code, .. }) if code != NULL => (
+                        lanes(&Operand::Scalar { code, dwords: 1 }, &vec, &uni),
+                        lanes(&Operand::Scalar { code: code + 1, dwords: 1 }, &vec, &uni),
+                    ),
+                    Some(&Operand::Const(128)) => (vec![Sym::K(0); wave as usize], vec![Sym::K(0); wave as usize]),
+                    _ => return vec![None; wave as usize],
+                };
+                lo.into_iter().zip(hi).map(|(l, h)| Pair::of(l, h)).collect()
+            };
+            let (a, b) = (pair(v.src.first()), pair(v.src.get(1)));
+            let follows = !modifiers && v.dpp.is_none();
+            let old = |r: u8| lanes(&Operand::Vector { reg: r, dwords: 1 }, &vec, &uni);
+            let (old_lo, old_hi) = (old(dreg), old(dreg + 1));
+            let (mut lo, mut hi) = (Vec::with_capacity(wave as usize), Vec::with_capacity(wave as usize));
+            for l in 0..wave as usize {
+                let sum = match (a[l], b[l]) {
+                    (Some(x), Some(y)) if follows => add64(x, y),
+                    _ => None,
+                };
+                let (sl, sh) = sum.map_or((Sym::Unknown, Sym::Unknown), Pair::syms);
+                let writes = exec >> l & 1 != 0;
+                lo.push(if writes { sl } else { old_lo[l] });
+                hi.push(if writes { sh } else { old_hi[l] });
+            }
+            if let Some(w) = inst.write(Reg::V(dreg)) {
+                vec.insert(w, lo);
+            }
+            if let Some(w) = inst.write(Reg::V(dreg + 1)) {
+                vec.insert(w, hi);
+            }
+            continue;
+        }
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
             else {
                 continue;
             };
-            let l = lane_number(lane);
+            let l = match *lane {
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Literal(x) => Some(x),
+                _ => None,
+            };
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
@@ -455,130 +600,6 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
-            continue;
-        }
-        if name == "v_add_f64"
-            && !modifiers
-            && v.dpp.is_none()
-            && let Some(Operand::Vector { reg: dreg, .. }) = v.dst
-            && let (Some(dst_lo), Some(dst_hi)) =
-                (inst.write(Reg::V(dreg)), inst.write(Reg::V(dreg + 1)))
-        {
-            let pair_lanes = |op: Option<&Operand>| -> Option<(Vec<Sym>, Vec<Sym>)> {
-                match *op? {
-                    Operand::Vector { reg, .. } => Some((
-                        lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni),
-                        lanes(
-                            &Operand::Vector {
-                                reg: reg + 1,
-                                dwords: 1,
-                            },
-                            &vec,
-                            &uni,
-                        ),
-                    )),
-                    Operand::Scalar { code, .. } if code != NULL => Some((
-                        lanes(&Operand::Scalar { code, dwords: 1 }, &vec, &uni),
-                        lanes(
-                            &Operand::Scalar {
-                                code: code + 1,
-                                dwords: 1,
-                            },
-                            &vec,
-                            &uni,
-                        ),
-                    )),
-                    _ => None,
-                }
-            };
-            let old_lo = lanes(
-                &Operand::Vector {
-                    reg: dreg,
-                    dwords: 1,
-                },
-                &vec,
-                &uni,
-            );
-            let old_hi = lanes(
-                &Operand::Vector {
-                    reg: dreg + 1,
-                    dwords: 1,
-                },
-                &vec,
-                &uni,
-            );
-            let f64_term = |lo_s: Sym, hi_s: Sym| -> Option<(Value, Value, Value, u64)> {
-                match (lo_s, hi_s) {
-                    (
-                        Sym::Red {
-                            op: None,
-                            src: lo,
-                            mask: ml,
-                            ident: 0,
-                            lanes: ll,
-                        },
-                        Sym::Red {
-                            op: None,
-                            src: hi,
-                            mask: mh,
-                            ident: 0,
-                            lanes: lh,
-                        },
-                    ) if ml == mh && ll == lh => Some((lo, hi, ml, ll)),
-                    (
-                        Sym::Red64F {
-                            lo: lo1,
-                            hi: hi1,
-                            mask: m1,
-                            lanes: l1,
-                            high: false,
-                        },
-                        Sym::Red64F {
-                            lo: lo2,
-                            hi: hi2,
-                            mask: m2,
-                            lanes: l2,
-                            high: true,
-                        },
-                    ) if (lo1, hi1, m1, l1) == (lo2, hi2, m2, l2) => Some((lo1, hi1, m1, l1)),
-                    _ => None,
-                }
-            };
-            let mut out_lo = vec![Sym::Unknown; wave as usize];
-            let mut out_hi = vec![Sym::Unknown; wave as usize];
-            if let (Some((alo, ahi)), Some((blo, bhi))) =
-                (pair_lanes(v.src.first()), pair_lanes(v.src.get(1)))
-            {
-                for l in 0..wave as usize {
-                    let (rl, rh) = match (f64_term(alo[l], ahi[l]), f64_term(blo[l], bhi[l])) {
-                        (Some((lo1, hi1, m1, la)), Some((lo2, hi2, m2, lb)))
-                            if (lo1, hi1, m1) == (lo2, hi2, m2) && la & lb == 0 =>
-                        {
-                            (
-                                Sym::Red64F {
-                                    lo: lo1,
-                                    hi: hi1,
-                                    mask: m1,
-                                    lanes: la | lb,
-                                    high: false,
-                                },
-                                Sym::Red64F {
-                                    lo: lo1,
-                                    hi: hi1,
-                                    mask: m1,
-                                    lanes: la | lb,
-                                    high: true,
-                                },
-                            )
-                        }
-                        _ => (Sym::Unknown, Sym::Unknown),
-                    };
-                    out_lo[l] = if exec >> l & 1 != 0 { rl } else { old_lo[l] };
-                    out_hi[l] = if exec >> l & 1 != 0 { rh } else { old_hi[l] };
-                }
-            }
-            vec.insert(dst_lo, out_lo);
-            vec.insert(dst_hi, out_hi);
             continue;
         }
         let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
@@ -760,10 +781,19 @@ fn constant(inst: &Inst) -> Option<u64> {
     }
 }
 
-/// The shape of a scalar.
-fn single(s: Sym, wave: u32) -> Option<Shape> {
-    let all = u64::MAX >> (64 - wave);
-    match s {
+/// The shape of each value, where every lane agrees on one.
+fn shapes(
+    vec: HashMap<Value, Vec<Sym>>,
+    uni: HashMap<Value, Sym>,
+    wave: u32,
+) -> HashMap<Value, Shape> {
+    let all = if wave == 64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    let mut out = HashMap::new();
+    let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -773,27 +803,17 @@ fn single(s: Sym, wave: u32) -> Option<Shape> {
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
-        Sym::Red64F {
+        Sym::Half64 {
+            high,
             lo,
             hi,
             mask,
             lanes,
-            high,
-        } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
+        } if lanes == all => Some(Shape::Sum64 { high, lo, hi, mask }),
         _ => None,
-    }
-}
-
-/// The shape of each value, where every lane agrees on one.
-fn shapes(
-    vec: HashMap<Value, Vec<Sym>>,
-    uni: HashMap<Value, Sym>,
-    wave: u32,
-) -> HashMap<Value, Shape> {
-    let all = u64::MAX >> (64 - wave);
-    let mut out = HashMap::new();
+    };
     for (v, s) in uni {
-        if let Some(sh) = single(s, wave) {
+        if let Some(sh) = single(s) {
             out.insert(v, sh);
         }
     }
@@ -833,13 +853,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
-            Sym::Red64F {
+            Sym::Half64 {
+                high,
                 lo,
                 hi,
                 mask,
                 lanes,
-                high,
-            } if lanes == all => Some(Shape::ActiveF64(lo, hi, mask, high)),
+            } if lanes == all => Some(Shape::Sum64 { high, lo, hi, mask }),
             _ => None,
         };
     }
@@ -1145,40 +1165,6 @@ mod tests {
             );
             assert_eq!(sec.shapes.get(&v4_val), None);
         }
-    }
-
-    /// A wave OR whose last step stays in the section's VGPR: the lower
-    /// lanes add the first half's to themselves, so only the upper ones
-    /// hold the whole, and the last lane is read after the section (an
-    /// upscaler's programs).
-    #[test]
-    fn one_lane_of_what_a_section_leaves_is_read_after_it() {
-        let words = |lane: u32| {
-            let mut w = WAVE_OR_V7_TO_S7[..14].to_vec(); // .. v_or_b32 v1, v2, v1
-            w.extend([
-                0xD760_0007,
-                0x0001_0101, // v_readlane_b32 s7, v1, 0
-                0x3802_0207, // v_or_b32 v1, s7, v1
-                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
-                0xD760_0006,
-                0x0001_0101 | lane << 9, // v_readlane_b32 s6, v1, lane
-                S_ENDPGM,
-            ]);
-            w
-        };
-        let read = |lane: u32| {
-            let p = build(&words(lane), true);
-            let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(4)).unwrap();
-            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
-            let got = insts[insts.len() - 2].write(Reg::S(6)).unwrap();
-            let sec = &sections(&p, 0)[&0];
-            (sec.reads.get(&got).copied(), Shape::Active(Op::Or, v7, saved, 0))
-        };
-        let (found, whole) = read(63);
-        assert_eq!(found, Some(whole));
-        // Lane 0 has the first half's alone: still a lane read.
-        assert_eq!(read(0).0, None);
     }
 
     /// `WaveActiveSum` of 16-bit floats, as compiled in

@@ -123,6 +123,29 @@ impl Host {
         }
     }
 
+    /// The device's wave sizes (`WaveLaneCountMin`, `WaveLaneCountMax`); `None` if it does not
+    /// say.
+    pub fn wave_lanes(&self) -> Option<(u32, u32)> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a valid out pointer of the feature's own type and size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .ok()?;
+        }
+        Some((o.WaveLaneCountMin, o.WaveLaneCountMax))
+    }
+
+    /// Whether the device can run waves of `lanes` (a program declaring `WaveSize(lanes)`);
+    /// true when it does not say.
+    pub fn runs_waves_of(&self, lanes: u32) -> bool {
+        self.wave_lanes().is_none_or(|(min, max)| (min..=max).contains(&lanes))
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -185,24 +208,12 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size.
-        // Older runtimes may not recognize OPTIONS19; that means no support.
-        let aniso_point_mip_supported = unsafe {
-            self.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
+                    Filter: D3D12_FILTER(d.filter as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -599,6 +610,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         .collect();
     s.m.terminate(b, Term::Ret);
     HostShader {
+        dispatch_x_one: false,
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {
@@ -994,8 +1006,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
-    Cube(u32, u16, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
+    Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1170,23 +1182,20 @@ impl Host {
                 at.ptr += i * view_size;
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
-                        let (w, h, mut texels, faces, mips) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Cube(n, mips, t) => (n, n, t, 6, mips),
+                        let (w, h, texels, faces) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1),
+                            View::Cube(n, t) => (n, n, t, 6),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
-                        desc.MipLevels = mips;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        for sub in 0..u32::from(mips) * faces {
-                            let mip = sub % u32::from(mips);
-                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
-                            let pitch = (w as usize * 16).next_multiple_of(256);
+                        let pitch = (w as usize * 16).next_multiple_of(256);
+                        for face in 0..faces as usize {
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1194,10 +1203,9 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let (level, rest) = texels.split_at((w * h) as usize);
-                            texels = rest;
+                            let texels = &texels[face * (w * h) as usize..];
                             for y in 0..h as usize {
-                                let row = &level[y * w as usize..(y + 1) * w as usize];
+                                let row = &texels[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1206,7 +1214,7 @@ impl Host {
                             }
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = sub;
+                            at_face.Anonymous.SubresourceIndex = face as u32;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1228,7 +1236,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: u32::from(mips),
+                                    MipLevels: 1,
                                     ..Default::default()
                                 },
                             },

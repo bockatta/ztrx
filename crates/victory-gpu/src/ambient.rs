@@ -141,6 +141,21 @@ fn reflect_bounds() -> (f32, f32) {
     })
 }
 
+/// Maximum ratio of the title's own probe output to keep over our directional
+/// estimate (`VICTORY_AMBIENT_MOST=<ratio>`, default `0.0`: overwrite cleanly
+/// with the directional radiance-SH estimate so uninitialized screen-probe
+/// tile blocks never bleed onto characters; set e.g. `4.0` to retain sky probes).
+fn most_keep() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -349,6 +364,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (most <= 0.0) {
+        light[p] = pack(found);
+        return;
+    }
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -529,7 +548,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most_keep().to_bits();
     words[10] = if role == Role::Reflect { reflect_cap } else { air() }.to_bits();
     words[11] = reflect_floor.to_bits();
     let l = &list.list;

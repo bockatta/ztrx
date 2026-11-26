@@ -412,6 +412,10 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
+    pub(crate) fn dispatch_x_one(&self) -> bool {
+        self.compute && self.stages.iter().any(|s| s.translated().host.dispatch_x_one)
+    }
+
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {

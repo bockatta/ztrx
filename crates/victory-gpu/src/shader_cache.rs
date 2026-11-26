@@ -64,10 +64,14 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_BVH_MISS",
+            "FLAMINGO_BVH_MISS",
+            "FLAMINGO_QUAD_HELPERS",
+            "VICTORY_WAVE_PAIRS",
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
+            "VICTORY_LDS_LOOSE",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
@@ -177,7 +181,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -268,6 +272,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, u32::from(s.dispatch_x_one));
     out
 }
 
@@ -336,8 +341,14 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let dispatch_x_one = match r.word()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
+        dispatch_x_one,
         dxil,
         user_data,
         samplers,
@@ -356,6 +367,7 @@ mod tests {
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            dispatch_x_one: false,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,

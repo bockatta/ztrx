@@ -27,9 +27,9 @@
 //! its group id from v5 of the first lane (`v_readfirstlane`: the group
 //! times the group size). Lane n exports vertex n (`exp pos`, `exp param`)
 //! and primitive n (`exp prim`: 9-bit vertex indices at bits 0, 10, 20,
-//! each with an edge flag above it, bit 31 culls); `param` entries with
-//! bit 7 are per-primitive outputs. One lane sends the output counts
-//! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
+//! each followed by its edge flag; bit 31 culls); `param` entries with bit 7 are per-primitive outputs. One
+//! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
+//! primitives << 12).
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -70,6 +70,10 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Geometry: dword 0 (low) or 1 (high) of the pointer to the console
+    /// runtime's table, in the first two user-data SGPRs
+    /// ([`crate::merged::RUNTIME_TABLE`]).
+    RuntimeTable(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,12 +214,29 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
-        (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
-            let mut loaded = vec![
-                (Reg::V(0), Input::VertexId),
-                (Reg::V(2), Input::PrimitiveId),
-                (Reg::V(3), Input::InstanceId),
-            ];
+        // The ES half of a merged stage taken as a vertex shader whose
+        // exports are the records it writes (`handoff`): its vertex id in v0
+        // as the hardware VS gets it (not checked on the title's programs),
+        // the runtime table pointer where the layout leaves its dwords free.
+        (StageIo::Vs { inputs, outputs }, HwStage::Vs | HwStage::Es) => {
+            let mut loaded = if native.stage == HwStage::Es {
+                let first = native.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
+                let taken = native.layout.iter().any(|p| {
+                    let at = u32::from(native.stage.user_sgpr(p.user_data));
+                    at < u32::from(first) + 2 && u32::from(first) < at + p.sgprs
+                });
+                let mut v = vec![(Reg::V(0), Input::VertexId)];
+                if !taken {
+                    v.extend((0..2u8).map(|k| (Reg::S(first + k), Input::RuntimeTable(k))));
+                }
+                v
+            } else {
+                vec![
+                    (Reg::V(0), Input::VertexId),
+                    (Reg::V(2), Input::PrimitiveId),
+                    (Reg::V(3), Input::InstanceId),
+                ]
+            };
             for i in inputs {
                 for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
                     let input = Input::Attribute {
@@ -302,6 +323,23 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             ];
             (loaded, &[][..], &ms.outputs[..])
         }
+        // The halves of a merged ES+GS stage share the SGPRs: no exports (the
+        // ES half hands its records over through LDS, the GS half writes its
+        // output vertices there); the runtime table pointer is the one input
+        // known. The root layout wins where it covers those dwords.
+        (StageIo::Gs(_), HwStage::Gs) | (StageIo::Es(_), HwStage::Es) => {
+            let first = native.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
+            let taken = native.layout.iter().any(|p| {
+                let at = u32::from(native.stage.user_sgpr(p.user_data));
+                // (the count is read from the container: no overflow)
+                at < u32::from(first) + 2 && u32::from(first) < at.saturating_add(p.sgprs)
+            });
+            let loaded = (0..2u8)
+                .filter(|_| !taken)
+                .map(|k| (Reg::S(first + k), Input::RuntimeTable(k)))
+                .collect();
+            (loaded, &[][..], &[][..])
+        }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
     let inputs: Vec<(Value, Input)> = p
@@ -369,7 +407,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
-    let mut first_halves = Vec::new();
+    let mut preserved = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -383,7 +421,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => first_halves.push((site, attribute)),
+                        ("v_interp_p1_f32", _) => {}
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -403,9 +441,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {
-                        first_halves.push((site, attribute(inst, &v.src[0])?));
-                    }
+                    "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -419,6 +455,16 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                     _ => return Err(unsupported(at, "an interpolation form")),
                 },
+                Fields::Valu(v)
+                    if native.stage == HwStage::Ps
+                        && matches!(name, "v_fma_mixlo_f16" | "v_fma_mixhi_f16") =>
+                {
+                    if let Some(Operand::Vector { reg, .. }) = v.dst
+                        && let Some(old) = inst.read(Reg::V(reg))
+                    {
+                        preserved.push(old);
+                    }
+                }
                 Fields::Exp {
                     target,
                     src,
@@ -463,50 +509,26 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
-    if first_halves.is_empty() {
-        return Ok(io);
-    }
-    // A loaded i/j pair normally becomes one host interpolation: its first
-    // half need not be evaluated. A first half also read as data (or used
-    // without a second half) must keep P0 + i * P10. Follow phi uses too,
-    // without forcing ordinary pairs to read per-vertex attributes.
-    let folded: std::collections::HashSet<_> = io
-        .interps
-        .iter()
-        .filter_map(|(s, i)| matches!(i, Interp::Interpolated { .. }).then_some(*s))
-        .collect();
-    let mut used: std::collections::HashSet<_> = p
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(b, blk)| {
-            blk.insts
-                .iter()
-                .enumerate()
-                .map(move |(i, inst)| ((b, i), inst))
-        })
-        .filter(|(s, _)| !folded.contains(s))
-        .flat_map(|(_, inst)| inst.reads.iter().map(|r| r.1))
-        .collect();
-    loop {
-        let before = used.len();
-        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
-            if used.contains(&phi.value) {
-                used.extend(&phi.args);
+    // A mixed-f16 write preserves the other half of its old destination.
+    // If that value came from an elided P1, evaluate P1 as well as its P2.
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = preserved.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        if let Some(&(b, i)) = phis.get(&v) {
+            preserved.extend_from_slice(&p.blocks[b].phis[i].args);
+        } else if let Some(&site @ (b, i)) = defs.get(&v) {
+            let inst = &p.blocks[b].insts[i];
+            let attr = match &inst.fields {
+                Fields::Vintrp { attr, .. } if inst.name() == "v_interp_p1_f32" => attr,
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => &v.src[0],
+                _ => continue,
+            };
+            if !io.interps.iter().any(|(s, _)| *s == site) {
+                let attribute = attribute(inst, attr)?;
+                io.interps.push((site, Interp::Weighted { attribute }));
             }
-        }
-        if used.len() == before {
-            break;
-        }
-    }
-    for (site, attribute) in first_halves {
-        if !io.interps.iter().any(|(s, _)| *s == site)
-            && p.blocks[site.0].insts[site.1]
-                .writes
-                .iter()
-                .any(|w| used.contains(&w.1))
-        {
-            io.interps.push((site, Interp::Weighted { attribute }));
         }
     }
     Ok(io)
@@ -775,35 +797,30 @@ mod tests {
     }
 
     #[test]
-    fn first_halves_read_through_a_phi_keep_their_partial_values() {
+    fn preserved_interpolation_half_can_reach_a_mixed_write_through_a_phi() {
         let p = program(&[
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0
-            0xBF85_0002, // s_cbranch_scc1 -> second first half
-            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
-            0xBF82_0001, // s_branch -> export
-            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
-            0xF800_180F,
-            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
-            S_ENDPGM,
-        ]);
-        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
-        assert_eq!(io.interps.len(), 2);
-        assert!(
-            io.interps
-                .iter()
-                .all(|(_, i)| matches!(i, Interp::Weighted { .. }))
-        );
-    }
-
-    #[test]
-    fn a_standalone_f16_first_half_is_weighted() {
-        let p = program(&[
+            0xBF84_0004, // s_cbranch_scc0 .join
             0xD742_0002,
             0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
-            0xF800_180F,
-            0x0202_0202,
+            0xD75A_0003,
+            0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+            // .join: the other predecessor holds the entry value of v2.
+            0xCC21_0002,
+            0x03C9_E4F2, // v_fma_mixlo_f16 v2, 1.0, 1.0, 1.0
             S_ENDPGM,
         ]);
+        let entry = p
+            .inputs
+            .iter()
+            .find(|(reg, _)| *reg == Reg::V(2))
+            .unwrap()
+            .1;
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.phis)
+                .any(|phi| { phi.reg == Reg::V(2) && phi.args.contains(&entry) })
+        );
         let io = raise(
             &p,
             &pixel(
@@ -815,7 +832,9 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(matches!(&io.interps[..], [(_, Interp::Weighted { .. })]));
+        assert!(io.interps.iter().any(|&((b, i), ref interp)| {
+            p.blocks[b].insts[i].machine.offset == 4 && matches!(interp, Interp::Weighted { .. })
+        }));
     }
 
     #[test]
@@ -915,5 +934,47 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    fn geometry(layout: Vec<crate::native::RootParam>) -> NativeProgram {
+        NativeProgram {
+            stage: HwStage::Gs,
+            wave64: true,
+            vgprs: 256,
+            layout,
+            used: vec![],
+            io: StageIo::Gs(Default::default()),
+            code: vec![],
+        }
+    }
+
+    #[test]
+    fn a_geometry_program_gets_the_runtime_table_and_exports_nothing() {
+        // s_load_dword s0, s[8:9], 0xb8
+        let p = program(&[0xF400_0004, 0xFA00_00B8, S_ENDPGM]);
+        let io = raise(&p, &geometry(vec![])).unwrap();
+        let mut got: Vec<_> = io.inputs.iter().map(|i| i.1).collect();
+        got.sort_by_key(|i| format!("{i:?}"));
+        assert_eq!(got, [Input::RuntimeTable(0), Input::RuntimeTable(1)]);
+        assert!(io.exports.is_empty() && io.interps.is_empty());
+        // Where the title's root layout covers the dwords, they are its own.
+        let own = crate::native::RootParam {
+            root: crate::native::RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        assert!(raise(&p, &geometry(vec![own])).unwrap().inputs.is_empty());
+    }
+
+    #[test]
+    fn geometry_io_is_for_the_geometry_stage_only() {
+        // Stage data of a geometry program on another stage's program.
+        let p = program(&[S_ENDPGM]);
+        let mut native = geometry(vec![]);
+        native.stage = HwStage::Vs;
+        assert!(raise(&p, &native).is_err());
     }
 }
