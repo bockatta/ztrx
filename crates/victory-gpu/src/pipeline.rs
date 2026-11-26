@@ -68,6 +68,10 @@ pub(crate) struct Shader {
     /// and reflections when run without ray tracing (Belobug 6986a571).
     #[cfg(windows)]
     pub(crate) probe_rays: bool,
+    /// True for `ps_sky_paraboloid_reflection`, which renders the sky dome used
+    /// to track time-of-day exposure for the indirect-light stand-in (Belobug e48eb83e).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -125,6 +129,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     && bytes
                         .windows(b"CS_ScreenProbes_ActivateRays".len())
                         .any(|w| w == b"CS_ScreenProbes_ActivateRays"),
+                #[cfg(windows)]
+                draws_sky: stage == "pixel"
+                    && bytes
+                        .windows(crate::ambient::SKY.len())
+                        .any(|w| w == crate::ambient::SKY),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

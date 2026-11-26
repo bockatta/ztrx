@@ -1704,6 +1704,25 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
+/// Room check used during one-time character decoration bakes
+/// (`PS_BakeDecorations_*`, `draw.rs` `early_textures`).
+///
+/// During loading bakes (before world render targets exist), real VRAM usage is
+/// typically ~60-75% while `targets_room_kept()` + `card_room_kept()` reserves
+/// can trip normal `room()` prematurely and bake `#000000` skin onto NPCs.
+/// Allowing bakes while real usage is strictly under 86% of the DXGI budget
+/// keeps ~1.5 GB headroom for render targets and card buffers while ensuring
+/// character skin/clothing source textures upload before the one-time bake.
+#[cfg(windows)]
+pub(crate) fn bake_room(memory: Option<[u64; 4]>) -> bool {
+    if let Some([budget, used, ..]) = memory
+        && used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 86
+    {
+        return true;
+    }
+    room(memory)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as

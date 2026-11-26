@@ -34,12 +34,63 @@
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::core::s;
 
 use crate::host::{HostList, host};
+use crate::object::This;
+
+/// The pixel program that renders the sky dome as the title reflects it:
+/// `128x128 R16G16B16A16_FLOAT` in the title's own linear HDR light units
+/// (Belobug e48eb83e / 4f62c2a5). Used to match indirect ambient exposure
+/// across noon interiors (cafe), sunset (prison), and night automatically.
+pub(crate) const SKY: &[u8] = b"ps_sky_paraboloid_reflection";
+
+static SKY_IMAGE: Mutex<Option<Arc<crate::resource::HostTexture>>> = Mutex::new(None);
+
+/// Records the host copy of the title's sky dome texture when drawn.
+pub(crate) fn sky_drawn(image: usize) {
+    let Some(copy) = crate::resource::host_copy(image as This) else {
+        return;
+    };
+    // SAFETY: a live host texture.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return;
+    }
+    let mut held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.as_ref().is_some_and(|h| Arc::ptr_eq(h, &copy)) {
+        *held = Some(copy);
+    }
+}
+
+/// Sky-dome exposure curve (`VICTORY_AMBIENT_SKY=gain,least,power`, default
+/// `0.95,0.07,0.45`; set `off` to disable sky tracking).
+/// Maps night (`~0.001`) -> ~0.11, dusk/sunset (`~0.65`) -> ~0.85,
+/// midday/cafe (`~2..5`) -> ~1.37..2.03 linear HDR to match title auto-exposure.
+fn sky_follow() -> Option<[f32; 3]> {
+    static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_SKY").unwrap_or_default();
+        if set.trim().eq_ignore_ascii_case("off") || set.trim() == "0" {
+            return None;
+        }
+        let mut follow = [0.95f32, 0.07, 0.45];
+        for (to, v) in follow.iter_mut().zip(set.split(',')) {
+            if let Ok(v) = v.trim().parse::<f32>()
+                && v.is_finite()
+                && v >= 0.0
+            {
+                *to = v;
+            }
+        }
+        Some(follow)
+    })
+}
 
 /// Programs of the title the stand-in follows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,11 +170,12 @@ fn air() -> f32 {
     })
 }
 
-/// Maximum reflection brightness as a multiple of surrounding ambient light
-/// (`VICTORY_AMBIENT_REFLECT=<cap>`, default `0.65`; `0` leaves reflections
-/// untouched) and optional floor (`VICTORY_AMBIENT_REFLECT_FLOOR=<min>`,
-/// default `0.0`). Prevents unoccluded sky white-glaze on indoor glossy
-/// surfaces when rays are off (after Belobug c3bd5612).
+/// Soft-knee reflection compression threshold as a multiple of surrounding
+/// ambient light (`VICTORY_AMBIENT_REFLECT=<knee>`, default `0.85`; `0` leaves
+/// reflections untouched) and subtle minimum reflection floor
+/// (`VICTORY_AMBIENT_REFLECT_FLOOR=<min>`, default `0.07`, after Belobug
+/// c3bd5612). Keeps eyes and glossy indoor surfaces free of unoccluded white
+/// sky glaze while preserving crisp SSR reflections on counters/glass/metal.
 fn reflect_bounds() -> (f32, f32) {
     static SET: OnceLock<(f32, f32)> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -131,20 +183,20 @@ fn reflect_bounds() -> (f32, f32) {
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.65);
+            .unwrap_or(0.85);
         let floor = std::env::var("VICTORY_AMBIENT_REFLECT_FLOOR")
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0);
+            .unwrap_or(0.07);
         (cap, floor)
     })
 }
 
 /// Maximum ratio of the title's own probe output to keep over our directional
 /// estimate (`VICTORY_AMBIENT_MOST=<ratio>`, default `0.0`: overwrite cleanly
-/// with the directional radiance-SH estimate so uninitialized screen-probe
-/// tile blocks never bleed onto characters; set e.g. `4.0` to retain sky probes).
+/// so uninitialized screen-probe sky blocks never create a white glare box on
+/// characters in indoor cutscenes).
 fn most_keep() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -156,10 +208,10 @@ fn most_keep() -> f32 {
     })
 }
 
-/// Minimum warm depth-SSAO diffuse floor (`VICTORY_AMBIENT_FLOOR=<level>`,
-/// default `0.14`; `0` disables the floor). Ensures dark interiors (cafe,
-/// prison cell walls) remain clearly readable even when `CS_CacheScreenSpaceRadiance`
-/// is dim, while sunlit outdoor scenes exceed the floor naturally.
+/// Minimum scene-tinted diffuse floor (`VICTORY_AMBIENT_FLOOR=<level>`,
+/// default `0.04`; `0` disables the floor). Subtle enough to preserve rich
+/// colored bounce lighting and dark AO crevices while keeping shadowed indoor
+/// corners readable.
 fn ambient_floor() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
@@ -167,15 +219,15 @@ fn ambient_floor() -> f32 {
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.14)
+            .unwrap_or(0.04)
     })
 }
 
-/// Strength and radius of the creases' shade.
+/// Strength and radius of dual-scale contact + architectural GTAO/SSAO.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| {
-        let mut shade = [1.0, 0.6];
+        let mut shade = [1.05, 0.65];
         let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
         for (to, v) in shade.iter_mut().zip(set.split(',')) {
             if let Ok(v) = v.trim().parse() {
@@ -199,10 +251,14 @@ cbuffer Set : register(b0) {
     float follow; float most; float air; float reflect_floor;
 };
 Texture2D<float> depth : register(t0);
-// Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// Cells:
+//   [0 .. CELLS)                 = radiance RGB (a = 1)
+//   [CELLS]                      = slow temporal mean radiance RGB
+//   [CELLS + 1 .. 2*CELLS + 1)   = view-space position XYZ, w = z^2 area weight
+//   [2*CELLS + 1 .. 3*CELLS + 1) = view-space emitter surface normal XYZ
+//   [3*CELLS + 1]                = sky-dome exposure-matched ambient RGB (a = 1 when active)
 RWStructuredBuffer<float4> cells : register(u1);
-// Three a point: red, green and blue, each a mean and a direction.
+// Three a point: red, green and blue, each a mean (w) and a direction (xyz).
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
@@ -212,6 +268,17 @@ float3 seen(int2 p, float2 size) {
     float z = min(near / max(d, 1e-7), 1000.0);
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
+}
+
+// Reconstruct view-space surface normal from depth with silhouette-preserving diffs.
+float3 surface_normal(int2 p, float2 size, float3 c) {
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    return n;
 }
 
 #ifdef KEEP
@@ -247,8 +314,12 @@ void mean() {
 [numthreads(8, 4, 1)]
 void place(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
-    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
+    int2 q = int2((float2(at.xy) + 0.5) * size / float2(CX, CY));
+    float3 p = seen(q, size);
+    float3 n = surface_normal(q, size, p);
+    uint idx = at.y * CX + at.x;
+    cells[CELLS + 1 + idx] = float4(p, p.z * p.z);
+    cells[2 * CELLS + 1 + idx] = float4(n, 1.0);
 }
 #endif
 
@@ -258,16 +329,19 @@ void place(uint3 at : SV_DispatchThreadID) {
 void gather(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
-    float r2 = 0.25 + 0.0025 * p.z * p.z;
+    float r2 = 0.10 + 0.0014 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
     for (uint i = 0; i < CELLS; i++) {
         float4 c = cells[CELLS + 1 + i];
+        float3 nc = cells[2 * CELLS + 1 + i].xyz;
         float3 L = cells[i].rgb;
         float3 d = c.xyz - p;
         float dd = dot(d, d);
-        float w = c.w / (dd + r2);
         float3 dir = d / sqrt(dd + 0.25 * r2);
+        // Physical emitter facing: surfaces bounce light forward into the room they face.
+        float emit_facing = saturate(dot(-dir, nc) * 0.85 + 0.15);
+        float w = c.w * emit_facing / (dd + r2);
         whole += w;
         toward += w * dir;
         light += w * L;
@@ -328,28 +402,63 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
     float3 c = seen(p, size);
-    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
-    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
-    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
-    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
-    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
-    if (dot(n, c) > 0.0) n = -n;
-    // How open it is (as in beloooo's cd9f78ce).
+    float3 n = surface_normal(p, size, c);
+    // Dual-scale GTAO / contact + architectural corner AO + bent normal.
     float open = 1.0;
-    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+    float3 bent_n = n;
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
-    if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
-        float sum = 0.0;
-        const int N = 12;
-        for (int i = 0; i < N; i++) {
-            float a = i * 2.399963 + noise * 6.2831853;
-            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
-            float3 v = seen(p + int2(round(o)), size) - c;
-            float vv = dot(v, v);
-            float over = dot(v, n) - 0.004 * c.z - 0.005;
-            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+    if (strength > 0.0 && c.z < 350.0) {
+        float px_base = radius * size.y / (2.0 * tan_y * c.z);
+        float3 bent = float3(0.0, 0.0, 0.0);
+        // Scale 1: Tight contact AO (faces, collars, props, chair legs, window bars).
+        float r_tight = max(radius * 0.35, 0.14);
+        float px_tight = min(px_base * 0.35, 36.0);
+        float sum_tight = 0.0;
+        if (px_tight >= 1.25) {
+            const int NT = 8;
+            for (int i = 0; i < NT; i++) {
+                float a = i * 2.399963 + noise * 6.2831853;
+                float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / NT) * px_tight);
+                float3 v = seen(p + int2(round(o)), size) - c;
+                float vv = dot(v, v);
+                float inv_d = rsqrt(vv + 1e-6);
+                float over = dot(v, n) - 0.003 * c.z - 0.005;
+                float falloff = saturate(1.0 - vv / (r_tight * r_tight));
+                float occ = max(over, 0.0) * inv_d * falloff;
+                sum_tight += occ;
+                bent += (v * inv_d) * (1.0 - occ);
+            }
+            sum_tight /= NT;
         }
-        open = saturate(1.0 - strength * 2.0 * sum / N);
+        // Scale 2: Medium architectural corner AO (booths, wall-floor seams, ceiling corners)
+        // without over-darkening open walls inside small rooms like prison cells.
+        float r_wide = radius * 1.15;
+        float px_wide = min(px_base * 1.15, 110.0);
+        float sum_wide = 0.0;
+        if (px_wide >= 2.0) {
+            const int NW = 12;
+            for (int i = 0; i < NW; i++) {
+                float a = (i + 8) * 2.399963 + noise * 6.2831853;
+                float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / NW) * px_wide);
+                float3 v = seen(p + int2(round(o)), size) - c;
+                float vv = dot(v, v);
+                float inv_d = rsqrt(vv + 1e-6);
+                float over = dot(v, n) - 0.005 * c.z - 0.010;
+                float falloff = saturate(1.0 - vv / (r_wide * r_wide));
+                float occ = max(over, 0.0) * inv_d * falloff;
+                sum_wide += occ;
+                bent += (v * inv_d) * (1.0 - occ);
+            }
+            sum_wide /= NW;
+        }
+        float ao_tight = saturate(1.0 - strength * 1.70 * sum_tight);
+        float ao_wide  = saturate(1.0 - strength * 1.60 * sum_wide);
+        float dist_fade = saturate(1.0 - (c.z - 220.0) / 130.0);
+        // Physical multi-bounce lift: deep creases drop to crisp 28% shadow contrast
+        // rather than blacking out entire room walls.
+        float raw_ao = saturate(ao_tight * 0.55 + ao_wide * 0.45);
+        open = lerp(1.0, lerp(0.28, 1.0, raw_ao), dist_fade);
+        bent_n = normalize(n + bent * (0.035 * dist_fade));
     }
     float3 found;
     if (constant > 0.0) {
@@ -376,23 +485,75 @@ void raise(uint3 at : SV_DispatchThreadID) {
         sum += w;
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-    found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    if (reflect_floor > 0.0) {
-        found = max(found, float3(1.0, 0.98, 0.94) * reflect_floor * open);
+    // Directional SH1 bounce evaluated along bent normal for grounded colored bounce.
+    float3 dir_sh = all + 1.45 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
+    dir_sh = clamp(dir_sh, 0.15 * all, 2.8 * all);
+    float3 bounce = lerp(dir_sh, cells[CELLS].rgb, 0.08) * level;
+    float4 sky_entry = cells[3 * CELLS + 1];
+    if (sky_entry.a > 0.0) {
+        // Exposure-matched sky-dome indirect floor (Belobug e48eb83e/4f62c2a5),
+        // modulated by our directional SH1 lighting ratio and warm room tint so
+        // daytime interiors (cafe) are properly exposed with full 3D bounce & GTAO,
+        // while sunset (prison) and night stay naturally dark and atmospheric!
+        float all_luma = max(dot(all, LUMA), 1e-4);
+        float3 dir_ratio = clamp(dir_sh / all_luma, 0.45, 1.90);
+        float3 room_avg = max(cells[CELLS].rgb, float3(0.005, 0.0049, 0.0047));
+        float room_luma = max(dot(room_avg, LUMA), 0.005);
+        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.55, 1.55), 0.40);
+        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.55) * max(level, 1.0);
+        bounce = max(bounce, sky_fill);
+    } else if (reflect_floor > 0.0) {
+        float3 room_avg = max(cells[CELLS].rgb, float3(0.01, 0.0098, 0.0094));
+        float room_luma = max(dot(room_avg, LUMA), 0.01);
+        float3 room_tint = lerp(float3(1.0, 0.98, 0.94), clamp(room_avg / room_luma, 0.4, 1.8), 0.55);
+        bounce = max(bounce, room_tint * reflect_floor);
     }
+    found = bounce * open;
     if (most <= 0.0) {
         light[p] = pack(found);
         return;
     }
     float3 was = unpack(light[p]);
-    // What the program left counts as far as it can be true: the sky's light
-    // outdoors, not the blocks of other memory.
+    // Keep the title's own screen-space traced bounce & sky light where valid,
+    // modulated by our dual-scale GTAO so contact & corner shadows stay crisp.
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6));
+    was *= min(1.0, top / max(has, 1e-6)) * lerp(1.0, open, 0.70);
     light[p] = pack(max(was, found));
+}
+#endif
+
+#ifdef SKY
+#define RS_SKY "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), UAV(u1)"
+cbuffer SkySet : register(b0) {
+    float sky_gain; float sky_least; float sky_power; float sky_follow;
+};
+Texture2DArray<float4> sky_tex : register(t0);
+[RootSignature(RS_SKY)]
+[numthreads(1, 1, 1)]
+void sky_mean() {
+    uint sw, sh, slices;
+    sky_tex.GetDimensions(sw, sh, slices);
+    if (sw == 0 || sh == 0) {
+        cells[3 * CELLS + 1] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+    float3 sum = 0.0;
+    const int N = 8;
+    for (int y = 0; y < N; y++) {
+        for (int x = 0; x < N; x++) {
+            float3 there = sky_tex.Load(int4((x * 2 + 1) * sw / (N * 2), (y * 2 + 1) * sh / (N * 2), 0, 0)).rgb;
+            there = any(isnan(there)) || any(isinf(there)) ? 0.0 : there;
+            sum += clamp(there, 0.0, 8.0);
+        }
+    }
+    float3 mean = sum / (N * N);
+    float m = dot(mean, LUMA);
+    const float3 NIGHT = float3(0.6, 0.75, 1.0);
+    float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), mean / max(m, 1e-6), 0.45), saturate(m / 0.05));
+    float3 now = hue * (sky_gain * pow(max(m, 0.0), sky_power) + sky_least);
+    float4 was = cells[3 * CELLS + 1];
+    cells[3 * CELLS + 1] = float4(was.a > 0.0 ? lerp(was.rgb, now, sky_follow) : now, 1.0);
 }
 #endif
 
@@ -416,12 +577,22 @@ void clamp_reflect(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
     float3 c = unpack_r(reflected[p]);
-    float3 base = constant > 0.0 ? float3(1.0, 0.98, 0.94) * constant : cells[CELLS].rgb * level;
+    float4 sky_entry = cells[3 * CELLS + 1];
+    float3 rad_base = cells[CELLS].rgb * level;
+    float3 base = constant > 0.0
+        ? float3(1.0, 0.98, 0.94) * constant
+        : (sky_entry.a > 0.0 ? max(rad_base, sky_entry.rgb * level) : rad_base);
     float base_luma = max(dot(base, LUMA), 0.02);
     float has = dot(c, LUMA);
     if (air > 0.0) {
-        float cap = air * base_luma;
-        if (has > cap) c *= cap / max(has, 1e-6);
+        // Soft-knee shoulder: keeps glossy SSR reflections crisp up to `knee`
+        // while suppressing unoccluded indoor white sky-glaze on eyes/floors/cloth.
+        float knee = air * base_luma;
+        if (has > knee) {
+            float excess = has - knee;
+            float compressed = knee + excess / (1.0 + excess / max(knee * 0.50, 0.04));
+            c *= compressed / max(has, 1e-6);
+        }
     }
     if (reflect_floor > 0.0) {
         c = max(c, base * reflect_floor);
@@ -431,13 +602,15 @@ void clamp_reflect(uint3 at : SV_DispatchThreadID) {
 #endif
 "#;
 
-/// Bytes of the cells' buffer and of the points'.
+/// Bytes of the cells' buffer (radiance + mean + positions + emitter normals + sky exposure) and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const CELL_BYTES: u64 = (3 * CELLS + 2) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
+const SKY_SLOTS: u32 = 32;
 
 struct Pass {
     root: ID3D12RootSignature,
+    sky_root: ID3D12RootSignature,
     keep: ID3D12PipelineState,
     mean: ID3D12PipelineState,
     place: ID3D12PipelineState,
@@ -445,6 +618,12 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     reflect: ID3D12PipelineState,
+    sky_mean: ID3D12PipelineState,
+    sky_heap: ID3D12DescriptorHeap,
+    sky_cpu: usize,
+    sky_gpu: u64,
+    sky_step: u32,
+    sky_next: AtomicU32,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -477,9 +656,35 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let reflect = pipeline("REFLECT", s!("clamp_reflect"))?;
+    let sky_code = crate::host::compile(&format!("#define SKY\n{SOURCE}"), s!("sky_mean"), s!("cs_5_1"))?;
+    // SAFETY: self-contained root signature inside compiled bytecode; plain D3D12 creations.
+    let (sky_root, sky_mean, sky_heap, sky_cpu, sky_gpu, sky_step) = unsafe {
+        let sky_root: ID3D12RootSignature = device.CreateRootSignature(0, &sky_code)?;
+        let sky_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&sky_root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: sky_code.as_ptr().cast(),
+                BytecodeLength: sky_code.len(),
+            },
+            ..Default::default()
+        };
+        let sky_mean = device.CreateComputePipelineState(&sky_desc)?;
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        let sky_heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: SKY_SLOTS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })?;
+        let sky_cpu = sky_heap.GetCPUDescriptorHandleForHeapStart().ptr;
+        let sky_gpu = sky_heap.GetGPUDescriptorHandleForHeapStart().ptr;
+        let sky_step = device.GetDescriptorHandleIncrementSize(kind);
+        (sky_root, sky_mean, sky_heap, sky_cpu, sky_gpu, sky_step)
+    };
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
+        sky_root,
         keep,
         mean,
         place,
@@ -487,6 +692,12 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
+        sky_mean,
+        sky_heap,
+        sky_cpu,
+        sky_gpu,
+        sky_step,
+        sky_next: AtomicU32::new(0),
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -522,13 +733,88 @@ pub(crate) struct Views {
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
+    /// The title's currently bound descriptor heaps (restored after sky-dome sampling).
+    pub(crate) view_heap: ID3D12DescriptorHeap,
+    pub(crate) sampler_heap: Option<ID3D12DescriptorHeap>,
+}
+
+/// Samples the title's sky dome (`ps_sky_paraboloid_reflection`) into
+/// `cells[3 * CELLS + 1]` and restores the list's descriptor heaps.
+fn update_sky(list: &HostList, pass: &Pass, views: &Views) {
+    let Some([gain, least, power]) = sky_follow() else {
+        return;
+    };
+    let Some(sky_copy) = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return;
+    };
+    let Some(host) = host() else {
+        return;
+    };
+    let read_state =
+        (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32;
+    list.keep(&sky_copy.texture);
+    list.settle(&sky_copy, read_state);
+    // SAFETY: live sky texture; ring slot in our own shader-visible heap; valid open command list.
+    unsafe {
+        let d = sky_copy.texture.GetDesc();
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!(
+                width = d.Width,
+                height = d.Height,
+                slices = d.DepthOrArraySize,
+                gain,
+                least,
+                power,
+                "ambient light follows the sky dome for time-of-day exposure"
+            );
+        });
+        let slot = pass.sky_next.fetch_add(1, Ordering::Relaxed) % SKY_SLOTS;
+        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: pass.sky_cpu + (slot * pass.sky_step) as usize,
+        };
+        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: pass.sky_gpu + u64::from(slot * pass.sky_step),
+        };
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: d.Format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: 1,
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize).max(1),
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        host.device.CreateShaderResourceView(&sky_copy.texture, Some(&srv), cpu);
+        let l = &list.list;
+        let sky_consts = [gain.to_bits(), least.to_bits(), power.to_bits(), 0.08f32.to_bits()];
+        l.SetDescriptorHeaps(&[Some(pass.sky_heap.clone())]);
+        l.SetComputeRootSignature(&pass.sky_root);
+        l.SetComputeRoot32BitConstants(0, 4, sky_consts.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, gpu);
+        l.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
+        l.SetPipelineState(&pass.sky_mean);
+        l.Dispatch(1, 1, 1);
+        uav_barrier(l);
+        // Restore the title's heaps before running the main resolve/reflect passes.
+        if let Some(sampler) = &views.sampler_heap {
+            l.SetDescriptorHeaps(&[Some(views.view_heap.clone()), Some(sampler.clone())]);
+        } else {
+            l.SetDescriptorHeaps(&[Some(views.view_heap.clone())]);
+        }
+    }
 }
 
 /// After the title's program of that role, in `list` with the program's view
 /// heap set. Replaces the list's compute root signature and pipeline; false
 /// if it recorded nothing.
 pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
-    use std::sync::atomic::Ordering;
     let Some(pass) = pass() else {
         return false;
     };
@@ -557,6 +843,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
+    if role == Role::Resolve && constant == 0.0 {
+        update_sky(list, pass, views);
+    }
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
     let mut words = [0u32; 12];
