@@ -26,7 +26,7 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, pack: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -124,6 +124,22 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.last().copied().unwrap_or(0.0),
         times.iter().sum::<f64>() / 1e3
     );
+    if pack {
+        let mut to_pack: Vec<usize> = (0..keys.len())
+            .filter(|&n| {
+                let key = keys[n].as_str();
+                !bad.contains(key) && (!used || early.contains(key))
+            })
+            .collect();
+        to_pack.truncate(limit.unwrap_or(usize::MAX));
+        let pack_began = Instant::now();
+        println!("packing {} pipelines into host-pipelines.bin ({jobs} threads)...", to_pack.len());
+        let (packed_ok, packed_bad) = known::pack(&dir, &to_pack, jobs);
+        println!(
+            "packed {packed_ok} pipelines ({packed_bad} refused) into host-pipelines.bin in {:.1} s",
+            pack_began.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
 }
 

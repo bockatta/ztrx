@@ -156,6 +156,21 @@ fn most_keep() -> f32 {
     })
 }
 
+/// Minimum warm depth-SSAO diffuse floor (`VICTORY_AMBIENT_FLOOR=<level>`,
+/// default `0.14`; `0` disables the floor). Ensures dark interiors (cafe,
+/// prison cell walls) remain clearly readable even when `CS_CacheScreenSpaceRadiance`
+/// is dim, while sunlit outdoor scenes exceed the floor naturally.
+fn ambient_floor() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_FLOOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.14)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -364,6 +379,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (reflect_floor > 0.0) {
+        found = max(found, float3(1.0, 0.98, 0.94) * reflect_floor * open);
+    }
     if (most <= 0.0) {
         light[p] = pack(found);
         return;
@@ -550,7 +568,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = most_keep().to_bits();
     words[10] = if role == Role::Reflect { reflect_cap } else { air() }.to_bits();
-    words[11] = reflect_floor.to_bits();
+    words[11] = if role == Role::Resolve { ambient_floor() } else { reflect_floor }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
