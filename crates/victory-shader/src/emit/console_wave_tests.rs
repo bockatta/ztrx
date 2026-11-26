@@ -78,7 +78,7 @@ fn program(body: &[u32], threads: u32) -> NativeProgram {
 }
 
 /// The whole translation for a host whose waves have at most `host_wave` lanes.
-fn translate(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderError> {
+pub(super) fn translate(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderError> {
     let bytes = empty_container();
     let c = Container::parse(&bytes)?;
     let p = crate::spill::build(native)?;

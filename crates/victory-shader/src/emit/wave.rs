@@ -37,6 +37,22 @@ pub(crate) enum Op {
 }
 
 impl Op {
+    /// The scalar operations a wave reduction combines its halves with (the two lanes read
+    /// with `v_readlane`). (Upstream VIctory a8bfe78.)
+    fn of_scalar(name: &str) -> Option<Op> {
+        Some(match name {
+            "s_add_u32" | "s_add_i32" => Op::AddU,
+            "s_min_u32" => Op::MinU,
+            "s_max_u32" => Op::MaxU,
+            "s_min_i32" => Op::MinI,
+            "s_max_i32" => Op::MaxI,
+            "s_and_b32" => Op::And,
+            "s_or_b32" => Op::Or,
+            "s_xor_b32" => Op::Xor,
+            _ => return None,
+        })
+    }
+
     fn of(name: &str) -> Option<Op> {
         Some(match name {
             // the low dword of a 64-bit sum (`v_add_co_ci_u32` carries into
@@ -208,6 +224,20 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     out
 }
 
+/// A scalar operand as the simulation has it: a uniform it followed, a constant, or the
+/// value itself.
+fn scalar_sym(inst: &Inst, op: &Operand, uni: &HashMap<Value, Sym>) -> Sym {
+    match *op {
+        Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
+            Some(x) => uni.get(&x).copied().unwrap_or(Sym::Uni(x)),
+            None => Sym::Unknown,
+        },
+        Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
+        Operand::Literal(x) => Sym::K(x),
+        _ => Sym::Unknown,
+    }
+}
+
 fn saved_code(inst: &Inst) -> u8 {
     match &inst.fields {
         Fields::Sop {
@@ -349,23 +379,28 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             {
                 masked.push(w);
             }
-            if name == "s_mov_b32"
-                && let (Some(Operand::Scalar { code: dc, .. }), Some(s0)) = (dst, src.first())
-                && *dc != NULL
-                && let Some(w) = inst.write(Reg::S(*dc))
-            {
-                let sym = match *s0 {
-                    Operand::Scalar { code, .. } if code != NULL => inst
-                        .read(Reg::S(code))
-                        .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
-                    Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
-                    Operand::Literal(x) => Sym::K(x),
-                    _ => Sym::Unknown,
-                };
-                uni.insert(w, sym);
-            }
+            // A uniform copied, or two combined: the halves of a wave64 reduction read
+            // with `v_readlane` (lanes 0 and 32) and joined with `s_add_u32`, `s_min_u32`, ...
+            // (upstream VIctory a8bfe78).
+            let scalar = |k: usize| {
+                src.get(k)
+                    .map_or(Sym::Unknown, |o| scalar_sym(inst, o, &uni))
+            };
+            let result = match (name, Op::of_scalar(name)) {
+                ("s_mov_b32", _) => scalar(0),
+                (_, Some(op)) => combine(op, scalar(0), scalar(1)),
+                _ => Sym::Unknown,
+            };
+            let out = match dst {
+                Some(Operand::Scalar { code, .. }) if *code != NULL => inst.write(Reg::S(*code)),
+                _ => None,
+            };
             for &(_, w) in &inst.writes {
-                uni.entry(w).or_insert(Sym::Unknown);
+                if Some(w) == out {
+                    uni.insert(w, result);
+                } else {
+                    uni.entry(w).or_insert(Sym::Unknown);
+                }
             }
             continue;
         }

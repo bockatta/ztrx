@@ -2398,6 +2398,23 @@ impl<'a> Lower<'a> {
                     let rb = bits(self, r);
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
+                    // A console wave with no upper half (the last of a group whose threads
+                    // past a multiple of 64 are 32 or fewer) gets 0 for it from the exchange;
+                    // it is the operation's identity (not 0 for MIN, AND or a signed MAX).
+                    let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+                    let rest = group % 64;
+                    let hi = if rest != 0 && rest <= 32 {
+                        let t = self.console_thread();
+                        let (six, last) = (self.s.m.i32(6), self.s.m.i32(group / 64));
+                        let c = self.cur;
+                        let wave = self.s.m.bin(c, Bin::LShr, t, six);
+                        let alone = self.s.m.cmp(c, pred::EQ, wave, last);
+                        let id = self.s.m.i32(ident);
+                        self.s.m.select(c, alone, id, hi)
+                    } else {
+                        hi
+                    };
+                    let c = self.cur;
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -8279,9 +8296,19 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
+            // Row (16 lanes) and bank (4 lanes of a row) write masks. The rows are the
+            // console wave's: a console wave of 64 run as two host waves of 32 has rows 2
+            // and 3 in its upper half, whose host lanes are 0..31 (the console thread's
+            // place in its wave, not the host lane, names the row).
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            let row_lane = if self.halves.is_some() {
+                let t = self.console_thread();
+                let k63 = k(self, 63);
+                self.s.m.bin(c, Bin::And, t, k63)
+            } else {
+                lane
+            };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);

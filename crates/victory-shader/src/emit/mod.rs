@@ -85,6 +85,8 @@ mod container;
 #[cfg(all(test, windows))]
 mod console_wave_tests;
 #[cfg(all(test, windows))]
+mod belobug_wave64_tests;
+#[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
