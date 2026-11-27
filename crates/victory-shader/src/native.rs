@@ -61,12 +61,7 @@
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read). A
-//! geometry shader is one: the console links the ES program (in the vertex
-//! container) and the GS program (in the geometry container) into one merged
-//! stage ([`crate::merged`]). Their records are read as far as the common
-//! record goes (code, root layout, used resources, LDS bytes: [`MergedIo`]);
-//! their stage data is not.
+//! Merged stages keep their stage data in another layout (not read).
 //!
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
@@ -74,7 +69,7 @@
 //! Unknown versions are rejected so a format change shows up as an error.
 
 use crate::ShaderError::{self, Malformed};
-use crate::dxbc::{Container, FourCC, u32_at, u64_at};
+use crate::dxbc::{u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
@@ -125,6 +120,18 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+const FSPX_VERSION: u32 = 1;
+const FSPX_HEADER: usize = 0x10;
+const FSPX_PACKET: u32 = 0;
+const FSPX_CODE: u32 = 6;
+const FSPX_METADATA: u32 = 7;
+const PACKET_THREADS: usize = 0x0c;
+const PACKET_FLAGS: usize = 0x12;
+const PACKET_WAVE32: u16 = 1 << 4;
+const PACKET_RSRC1: usize = 0x14;
+const PACKET_RSRC2: usize = 0x18;
+const FSPX_RECORDS: usize = 0x18;
+const FSPX_RECORD: usize = 32;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -273,24 +280,6 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
-    /// The ES half of a merged ES+GS stage (the vertex container's program
-    /// that is not the hardware VS).
-    Es(MergedIo),
-    /// The GS half of a merged ES+GS stage. What the program reads on entry
-    /// is [`crate::io::raise`]'s and [`crate::merged`]'s.
-    Gs(MergedIo),
-}
-
-/// What the record of either half of a merged ES+GS stage ([`crate::merged`])
-/// holds that is read. The stage data after the record (output signature
-/// rows, limits) is in a layout nothing here has a fixture for, so it is not
-/// read: [`crate::merged::limits`] takes the limits from the code, and the
-/// output rows come from the container's signature part.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MergedIo {
-    /// LDS bytes the stage allocates (the ES records and the GS output
-    /// records live in it), from the common record ([`RECORD_LDS`]).
-    pub lds_bytes: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -432,19 +421,11 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The part holding a container's native programs: its `DXIL` part, else
-/// an `ACCC` part ([`crate::fspx`]).
-pub fn program_part<'a>(c: &Container<'a>) -> Option<&'a [u8]> {
-    c.part(FourCC::DXIL)
-        .or_else(|| c.part(FourCC::ACCC))
-        .map(|p| p.data)
-}
-
-/// The native programs in a `DXIL` part's data (empty for the PC layout),
-/// or the one of an `ACCC` part's `FSPX` image.
+/// The native programs in a `DXIL` part's data, or in an `ACCC` part's
+/// ([`fspx_program`]); empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
-    if part.get(0..4) == Some(crate::fspx::MAGIC) {
-        return Ok(vec![crate::fspx::program(part)?]);
+    if part.starts_with(b"FSPX") {
+        return Ok(vec![fspx_program(part)?]);
     }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
@@ -465,6 +446,129 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         out.extend(programs(&unpack(blob)?)?);
     }
     Ok(out)
+}
+
+/// The compute program of an `ACCC` part, which a container carries in place
+/// of `DXIL` when another compiler made the native code (the AMD
+/// FidelityFX upscaler's shaders). Layout as observed (offsets from "FSPX"):
+///
+/// ```text
+/// +0x00 "FSPX" u32 version (1), u32 entry count, u32 size; entries of 16 B
+///       from +0x10: u32 kind, u32 offset, u32 size, u32 0
+/// kind 0  pipeline registers, 0x1c B: +0x0c u16 x3 thread-group size,
+///         +0x12 u16 flags (bit 4 wave32), +0x14 COMPUTE_PGM_RSRC1,
+///         +0x18 COMPUTE_PGM_RSRC2
+/// kind 1  pipeline metadata (a hash); kind 6 the GFX10 code
+/// kind 7  program metadata: u32 0x403, u32 size - 0x14, u32 code dwords,
+///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
+///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
+///   0x41  a resource the code reads: u8 resource type (as FSSM's used
+///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
+///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
+///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
+///         u32 -1, u32 0
+///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
+///         u8 resource kind (DXIL's), u8 0, u32 register
+///   0x43  the shader hash (16 B); the last record
+/// ```
+pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if u32_at(part, 4)? != FSPX_VERSION {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX entry count"));
+    }
+    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
+        for i in 0..count {
+            let at = FSPX_HEADER + 16 * i;
+            if u32_at(part, at)? == kind {
+                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+                return bytes(part, offset.into(), size.into())
+                    .ok_or(Malformed("FSPX entry out of bounds"));
+            }
+        }
+        Err(Malformed("FSPX entry missing"))
+    };
+    let packet = entry(FSPX_PACKET)?;
+    let code = entry(FSPX_CODE)?;
+    let meta = entry(FSPX_METADATA)?;
+    if u32_at(meta, 8)? as usize * 4 != code.len() {
+        return Err(Malformed("FSPX code size disagrees"));
+    }
+    let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
+    // VGPRs in granules of 4 (wave64) or 8 (wave32).
+    let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
+    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
+    let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let mut layout: Vec<RootParam> = Vec::new();
+    let mut used = Vec::new();
+    for e in meta
+        .get(FSPX_RECORDS..)
+        .unwrap_or(&[])
+        .as_chunks::<FSPX_RECORD>()
+        .0
+    {
+        match e[0] {
+            0x41 => {}
+            0x42 => continue,
+            0x43 => break,
+            _ => return Err(Malformed("unknown FSPX metadata record")),
+        }
+        let root = RootType::from_raw(e[5].into());
+        let u = UsedResource {
+            kind: match e[4] {
+                0 => ResourceType::Srv,
+                1 => ResourceType::Sampler,
+                2 => ResourceType::Cbv,
+                3 => ResourceType::Uav,
+                n => ResourceType::Other(n),
+            },
+            root,
+            table_offset_dwords: le32(e, 8),
+            lower_bound: le32(e, 12),
+            stride: 0,
+            dwords: e[20],
+            user_data: e[21],
+            slot: e[22],
+        };
+        let sgprs = match root {
+            RootType::Table => 1,
+            RootType::Descriptor => 2,
+            // The code holds its words; no user data.
+            RootType::ImmediateSampler => 0,
+            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+        };
+        if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs,
+                base_register: u.lower_bound,
+                user_data: u.user_data,
+                slot: u.slot,
+            });
+        }
+        used.push(u);
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
+    data.get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .ok_or(Malformed("FSPX data out of bounds"))
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -622,15 +726,6 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
-            HwStage::Es | HwStage::Gs => {
-                let io = MergedIo {
-                    lds_bytes: u32_at(record, RECORD_LDS)?,
-                };
-                match stage {
-                    HwStage::Es => StageIo::Es(io),
-                    _ => StageIo::Gs(io),
-                }
-            }
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -704,6 +799,21 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     })
 }
 
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect())
+}
+
 fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
         .as_chunks::<5>()
@@ -716,25 +826,12 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|e| VsOutput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            param: e[2],
-            fp16: e[5] & 1 != 0,
-            pack2: e[5] & 2 != 0,
-        })
-        .collect();
+    let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
-    let StageIo::Vs { outputs, .. } = vs_io(data)? else {
-        unreachable!()
-    };
+    let outputs = vs_outputs(data)?;
     let info = data
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
@@ -761,9 +858,8 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
 }
 
-#[cfg(any(test, feature = "synthetic"))]
-pub(crate) mod tests {
-    #![cfg_attr(not(test), allow(dead_code, unused))]
+#[cfg(test)]
+mod tests {
     use super::*;
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -795,11 +891,6 @@ pub(crate) mod tests {
 
     /// FSSM blob with `programs` as (stage, code) pairs.
     fn fssm(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
-        fssm_lds(programs, 0)
-    }
-
-    /// [`fssm`] with every record's LDS byte count set.
-    pub(crate) fn fssm_lds(programs: &[(HwStage, &[u8])], lds: u32) -> Vec<u8> {
         let mut payload = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
         payload.resize(slot(HwStage::Cs) + 8, 0);
         for (_, at) in SLOTS {
@@ -815,8 +906,7 @@ pub(crate) mod tests {
             let flags = if stage == HwStage::Ps { FLAG_WAVE32 } else { 0 };
             payload.extend_from_slice(&[0; 4]);
             payload.extend_from_slice(&flags.to_le_bytes());
-            payload.resize(record as usize + RECORD_LDS, 0);
-            payload.extend_from_slice(&lds.to_le_bytes());
+            payload.resize(record as usize + RECORD_REGS, 0);
             payload.extend_from_slice(&(VGPRS | 31 << 20).to_le_bytes());
             payload.extend_from_slice(&empty_stage_data());
             payload.extend_from_slice(code);
@@ -858,47 +948,6 @@ pub(crate) mod tests {
             out.extend_from_slice(blob);
         }
         out
-    }
-
-    /// A shader container whose `DXIL` part holds one native blob with the
-    /// given programs (stage and code), as the title's containers do.
-    pub(crate) fn container(programs: &[(HwStage, &[u8])]) -> Vec<u8> {
-        container_lds(programs, 0)
-    }
-
-    /// [`container`] with more parts next to the `DXIL` one (signatures).
-    pub(crate) fn container_parts(
-        programs: &[(HwStage, &[u8])],
-        extra: &[(crate::dxbc::FourCC, &[u8])],
-    ) -> Vec<u8> {
-        let data = part(&[(KIND_NATIVE, &xbch(&fssm_lds(programs, 0)))]);
-        let mut parts = vec![(crate::dxbc::FourCC::DXIL, &data[..])];
-        parts.extend_from_slice(extra);
-        crate::dxbc::build(&parts)
-    }
-
-    /// [`container`] whose records say they allocate `lds` bytes of LDS.
-    pub(crate) fn container_lds(programs: &[(HwStage, &[u8])], lds: u32) -> Vec<u8> {
-        let data = part(&[(KIND_NATIVE, &xbch(&fssm_lds(programs, lds)))]);
-        crate::dxbc::build(&[(crate::dxbc::FourCC::DXIL, &data)])
-    }
-
-    #[test]
-    fn the_halves_of_a_merged_stage_carry_their_lds_size() {
-        // The two halves are in different containers: ES next to the VS
-        // (here alone), GS by itself. The LDS size is the common record's.
-        let read = |stage, lds| {
-            let blob = xbch(&fssm_lds(&[(stage, &VS_CODE)], lds));
-            native_programs(&part(&[(KIND_NATIVE, &blob)])).unwrap().remove(0)
-        };
-        let (es, gs) = (read(HwStage::Es, 0x3000), read(HwStage::Gs, 0x2800));
-        assert_eq!((es.stage, &es.io), (HwStage::Es, &StageIo::Es(MergedIo { lds_bytes: 0x3000 })));
-        assert_eq!((gs.stage, &gs.io), (HwStage::Gs, &StageIo::Gs(MergedIo { lds_bytes: 0x2800 })));
-        // A record that allocates none says so.
-        assert_eq!(read(HwStage::Gs, 0).io, StageIo::Gs(MergedIo::default()));
-        // Both are merged stages: user data starts after the 8 system SGPRs.
-        assert_eq!(HwStage::Gs.user_sgpr(0), 8);
-        assert_eq!(HwStage::Es.user_sgpr(0), 8);
     }
 
     #[test]
@@ -1080,6 +1129,16 @@ pub(crate) mod tests {
                 lds_bytes: 16,
             })
         );
+    }
+
+    #[test]
+    fn mesh_stage_io_ignores_unused_vs_input_count() {
+        let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Ms);
+        // Mesh stage data has no vertex inputs; E+0xc4 is unused by MS.
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert!(matches!(p.io, StageIo::Ms(_)));
     }
 
     #[test]

@@ -46,10 +46,8 @@ enum NodeAt {
     Buffer { handle: V, byte: V },
     /// In title memory: the raw view of the host copy holding the node's
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
-    /// the node's address (for the second half of a 128-byte node), and
-    /// whether this 64 KiB page is resident (`mapped`, `i1`; prevents unmapped
-    /// zero-reads from looking like valid child pointers or origin triangles,
-    /// after DexNom bc3cd4b0).
+    /// the node's address, for the second half of a 128-byte node, and
+    /// whether there is a copy.
     Memory { handle: V, byte: V, low: V, high: V, mapped: V },
 }
 
@@ -98,22 +96,6 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing node test's result");
         };
         let site = (b, i);
-        // Flamingo (`FLAMINGO_BVH_MISS=1`): every node test misses, for runs
-        // without the structure builder (`VICTORY_BVH_BUILDER` off). The
-        // title's structures are then never built, and its tracing programs
-        // read whatever title memory holds there: zeros read as a triangle at
-        // the origin, so rays came back hit and the light that needs them
-        // (bounce light, shadows of lamps and sky) came out black. A miss in
-        // every dword works for both node kinds: a box node with four
-        // invalid children, a triangle whose distance is a NaN.
-        if bvh_miss() {
-            let guard = self.guard(b, i)?;
-            let none = self.s.m.i32(u32::MAX);
-            for k in 0..4 {
-                self.write(inst, Reg::V(dst + k as u8), none, guard);
-            }
-            return Ok(());
-        }
         let nodes = self
             .x
             .res
@@ -242,8 +224,9 @@ impl<'a> Lower<'a> {
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
-    /// host copy holding the address, the byte in that view, and whether the
-    /// 64 KiB page is resident (`i1`).
+    /// host copy holding the address and the byte in that view
+    /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
+    /// is left for the host to fetch, for lanes that run).
     fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
@@ -263,20 +246,23 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at, inside);
         }
-        self.memory_mapped(low, high, guard, false)
+        let (handle, byte) = self.memory(low, high, guard, false);
+        let mapped = self.page_there.expect("memory says");
+        (handle, byte, mapped)
     }
 
-    /// The second 64-byte half of a 128-byte Box32 node may live in the next
-    /// 64 KiB page and another host copy.
+    /// The second 64 bytes of a 128-byte node: in a page, and in a copy, of
+    /// their own maybe. Goes on in another block.
     fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
         match at {
             NodeAt::Buffer { handle, byte } => {
-                let k64 = self.s.m.i32(64);
-                let byte = self.s.m.bin(self.cur, Bin::Add, byte, k64);
+                let size = self.s.m.i32(64);
+                let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
                 NodeAt::Buffer { handle, byte }
             }
             NodeAt::Memory { low, high, .. } => {
                 let (low, high) = self.address_plus(low, high, 64);
+                // Every lane in this block runs the instruction.
                 let (handle, byte, mapped) = self.bvh_memory(low, high, None);
                 NodeAt::Memory {
                     handle,
@@ -289,10 +275,9 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `count` dwords within a single aligned 64-byte part of the node from
-    /// `base` + `offset`, read four at a time.
+    /// `count` dwords of 64 bytes of a node from their byte `base` + `offset`
+    /// (`base` computed, `offset` fixed), read four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
-        let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let (handle, start_byte) = match at {
             NodeAt::Buffer { handle, byte } | NodeAt::Memory { handle, byte, .. } => (handle, byte),
@@ -302,6 +287,7 @@ impl<'a> Lower<'a> {
             let n = (count - start).min(4);
             let node_byte = offset + 4 * start;
             let mut byte = start_byte;
+            let c = self.cur;
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
             }
@@ -356,13 +342,15 @@ impl<'a> Lower<'a> {
         self.s
             .m
             .terminate(head, Term::CondBr(wide, wide_block, half_block));
-        // 32-bit floats: 12 dwords in the first 64-byte half, 12 in the second.
+        // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
         let mut words = self.bvh_node_words(at, None, 16, 12);
         let second = self.bvh_second_half(at);
         words.extend(self.bvh_node_words(second, None, 0, 12));
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
+        // (The look for the second half goes on in another block.)
+        let wide_block = self.cur;
         self.s.m.terminate(wide_block, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
         // of a dword first.
@@ -387,16 +375,17 @@ impl<'a> Lower<'a> {
         }
         self.s.m.terminate(half_block, Term::Br(join));
         self.cur = join;
-        // Unmapped pages read zeros, which look like valid child pointer 0 and
-        // a [0..0] bounding box. Require every page holding a child's bounds
-        // to be resident (DexNom bc3cd4b0).
-        let residency = match (at, second) {
+        // A page that is not there reads zeros, which are a child and a box:
+        // no child of it is hit. (The last two boxes of a 128-byte node are in
+        // its second half.)
+        let there = match (at, second) {
             (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
-                let second_ok = self.s.m.phi(join, self.s.m.type_of(first));
+                let i1t = self.s.m.type_of(first);
+                let mapped = self.s.m.phi(join, i1t);
                 self.s
                     .m
-                    .set_phi(second_ok, vec![(last, wide_block), (first, half_block)]);
-                let both = self.s.m.bin(join, Bin::And, first, second_ok);
+                    .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
+                let both = self.s.m.bin(join, Bin::And, first, mapped);
                 Some([first, first, both, both])
             }
             _ => None,
@@ -450,13 +439,12 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
-            // An absent child (NONE) must never receive a finite sort key,
-            // even if its stored bounds pass the slab test.
-            let present = self.s.m.cmp(c, pred::IULT, children[n], none);
-            let mut hit = self.s.m.bin(c, Bin::And, hit, present);
-            if let Some(pages) = residency {
-                hit = self.s.m.bin(c, Bin::And, hit, pages[n]);
-            }
+            let child = self.s.m.cmp(c, pred::NE, children[n], none);
+            let hit = self.s.m.bin(c, Bin::And, hit, child);
+            let hit = match there {
+                Some(there) => self.s.m.bin(c, Bin::And, hit, there[n]),
+                None => hit,
+            };
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
@@ -600,10 +588,7 @@ impl<'a> Lower<'a> {
         let back_ahead = self.s.m.cmp(c, pred::OLE, t, fzero);
         let back = self.s.m.bin(c, Bin::And, back, back_ahead);
         let ahead = self.s.m.bin(c, Bin::Or, front, back);
-        let mut hit = self.s.m.bin(c, Bin::And, inside, ahead);
-        if let NodeAt::Memory { mapped, .. } = at {
-            hit = self.s.m.bin(c, Bin::And, hit, mapped);
-        }
+        let hit = self.s.m.bin(c, Bin::And, inside, ahead);
         let miss = bvh::MISS.map(|f| self.s.m.f32(f.to_bits()));
         let out = [t, det, v, w];
         std::array::from_fn(|n| {
@@ -611,14 +596,4 @@ impl<'a> Lower<'a> {
             self.as_int(f)
         })
     }
-}
-
-/// Whether every ray-tracing node test misses (`VICTORY_BVH_MISS=1` or
-/// `FLAMINGO_BVH_MISS=1`; see [`Lower::bvh`]).
-fn bvh_miss() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1")
-            || std::env::var_os("FLAMINGO_BVH_MISS").is_some_and(|v| v == "1")
-    })
 }

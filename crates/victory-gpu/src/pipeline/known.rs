@@ -247,63 +247,6 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
     }
 }
 
-/// Compiles `which` known pipelines into the on-disk host pipeline library
-/// (`host-pipelines.bin`) using `jobs` threads and saves it immediately.
-/// Returns `(made, failed)`.
-pub fn pack(dir: &Path, which: &[usize], jobs: usize) -> (usize, usize) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    super::library::use_pipeline_cache(dir.to_path_buf());
-    let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| {
-        let _ = places.insert(hash, (stage, at, len));
-    });
-    let Ok(shader_blob) = std::fs::read(dir.join(SHADERS)) else {
-        return (0, which.len());
-    };
-    let wanted: HashSet<usize> = which.iter().copied().collect();
-    let mut entries = HashMap::new();
-    walk_pipelines(dir, |n, bytes| {
-        if wanted.contains(&n) {
-            entries.insert(n, bytes.to_vec());
-        }
-    });
-    let items: Vec<Vec<u8>> = which.iter().filter_map(|n| entries.remove(n)).collect();
-    let total = items.len();
-    let next = AtomicUsize::new(0);
-    let ok = AtomicUsize::new(0);
-    let bad = AtomicUsize::new(0);
-    let began = std::time::Instant::now();
-    std::thread::scope(|s| {
-        for _ in 0..jobs.max(1).min(total.max(1)) {
-            s.spawn(|| {
-                let mut read = |hash: &[u8; 32]| {
-                    let &(_, at, len) = places.get(hash)?;
-                    let start = at as usize;
-                    shader_blob.get(start..start + len as usize).map(|b| b.to_vec())
-                };
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(entry) = items.get(i) else { break };
-                    let made = parse(entry, &mut read)
-                        .and_then(|(shaders, g)| HostPipeline::new(&shaders, g.as_deref()))
-                        .is_some();
-                    if made {
-                        let done = ok.fetch_add(1, Ordering::Relaxed) + 1;
-                        if done % 500 == 0 {
-                            println!("packed {done} of {total}, {:.0} s", began.elapsed().as_secs_f64());
-                            super::library::save(true);
-                        }
-                    } else {
-                        bad.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-        }
-    });
-    super::library::save(true);
-    (ok.load(Ordering::Relaxed), bad.load(Ordering::Relaxed))
-}
-
 #[allow(clippy::type_complexity)]
 fn parse(
     entry: &[u8],

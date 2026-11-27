@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3, VK_F4, VK_F5, VK_F6, VK_F9};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3, VK_F9};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::{Host, HostList, transition};
@@ -30,7 +30,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 10;
+const LINES: u32 = 9;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -48,13 +48,6 @@ fn shown() -> &'static AtomicBool {
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
 
-fn foreground_is_ours() -> bool {
-    let mut process = 0;
-    // SAFETY: plain queries; room for the answer.
-    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
-    process == std::process::id()
-}
-
 /// F3 or F9 was pressed since the last call, with one of our windows in front.
 fn pressed() -> bool {
     static DOWN: AtomicBool = AtomicBool::new(false);
@@ -63,38 +56,10 @@ fn pressed() -> bool {
     if DOWN.swap(down, Ordering::Relaxed) || !down {
         return false;
     }
-    foreground_is_ours()
-}
-
-/// Polls runtime graphics hotkeys (F4 cycle preset, F5 cycle AO taps, F6 cycle
-/// contact shadows) when one of our windows is foreground.
-fn poll_graphics_hotkeys() {
-    static F4_DOWN: AtomicBool = AtomicBool::new(false);
-    static F5_DOWN: AtomicBool = AtomicBool::new(false);
-    static F6_DOWN: AtomicBool = AtomicBool::new(false);
-    // SAFETY: plain queries.
-    let (f4, f5, f6) = unsafe {
-        (
-            GetAsyncKeyState(i32::from(VK_F4)) < 0,
-            GetAsyncKeyState(i32::from(VK_F5)) < 0,
-            GetAsyncKeyState(i32::from(VK_F6)) < 0,
-        )
-    };
-    let e4 = f4 && !F4_DOWN.swap(f4, Ordering::Relaxed);
-    let e5 = f5 && !F5_DOWN.swap(f5, Ordering::Relaxed);
-    let e6 = f6 && !F6_DOWN.swap(f6, Ordering::Relaxed);
-    if !(e4 || e5 || e6) || !foreground_is_ours() {
-        return;
-    }
-    if e4 {
-        crate::graphics::cycle_preset();
-    }
-    if e5 {
-        crate::graphics::cycle_shading();
-    }
-    if e6 {
-        crate::graphics::cycle_shadows();
-    }
+    let mut process = 0;
+    // SAFETY: plain queries; room for the answer.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
+    process == std::process::id()
 }
 
 /// Seven rows of five dots, the leftmost the highest bit.
@@ -212,6 +177,29 @@ struct Counters([u64; COUNTERS]);
 
 const COUNTERS: usize = 11;
 
+#[cfg(not(feature = "diagnostics"))]
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    info.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    // SAFETY: valid handle and zeroed struct with `cb` initialized.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&raw mut info).cast(),
+            info.cb,
+        )
+    };
+    if ok != 0 {
+        (info.WorkingSetSize as u64, info.PrivateUsage as u64)
+    } else {
+        (0, 0)
+    }
+}
+
 impl Counters {
     fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
@@ -219,7 +207,7 @@ impl Counters {
         #[cfg(feature = "diagnostics")]
         let record_ns = crate::copystat::peek(crate::copystat::C::RecordNs);
         #[cfg(not(feature = "diagnostics"))]
-        let record_ns = 0u64;
+        let record_ns = 0;
         Counters([
             super::worked(),
             get(&CARD_CLOCK_US[0]),
@@ -253,14 +241,9 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     #[cfg(feature = "diagnostics")]
     let (working, private) = crate::copystat::process_memory();
     #[cfg(not(feature = "diagnostics"))]
-    let (working, private) = (0u64, 0u64);
+    let (working, private) = process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
-    let ram_line = if private > 0 {
-        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working))
-    } else {
-        "F9 OR F3 TOGGLE OVERLAY".to_owned()
-    };
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
@@ -268,9 +251,8 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
         format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        ram_line,
+        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        crate::graphics::hud_line(),
         format!("THIS PANEL {:.0} US A FRAME", cost),
     ]
 }
@@ -368,7 +350,6 @@ impl Panel {
     /// A frame was presented; `line`: the counters go back to 0 right behind
     /// this call. (Not shown it asks for the key's state and no more.)
     pub(super) fn frame(&mut self, line: bool) {
-        poll_graphics_hotkeys();
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
@@ -401,8 +382,8 @@ impl Panel {
         self.cost = now.elapsed();
     }
 
-    /// Records the copy of the box and on-screen cursor onto `back`, a buffer
-    /// of the swap chain of that size and format in the state to be copied into.
+    /// Records the copy of the box onto `back`, a buffer of the swap chain of
+    /// that size and format in the state to be copied into.
     pub(super) fn draw(
         &mut self,
         host: &Host,
@@ -411,82 +392,71 @@ impl Panel {
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
     ) {
-        // Not the title's: the frame recorder leaves it out.
-        #[cfg(feature = "diagnostics")]
-        let _ours = crate::replay::record::unrecorded();
-        self.draw_box(host, list, back, (width, height), format);
-        self.cursor.draw(host, list, back, (width, height), format);
-    }
-
-    fn draw_box(
-        &mut self,
-        host: &Host,
-        list: &HostList,
-        back: &ID3D12Resource,
-        (width, height): (u32, u32),
-        format: DXGI_FORMAT,
-    ) {
-        if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
-            return;
-        }
-        let began = Instant::now();
-        let scale = scale(height);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, format, scale);
-            self.failed = self.buffers.is_none();
-            self.changed = true;
-        }
-        let Some(buffers) = &mut self.buffers else { return };
-        if std::mem::take(&mut self.changed) {
-            buffers.write(&self.lines);
-        }
-        let (w, h) = size(scale);
-        let list = &list.list;
-        // SAFETY: an open list and live resources; the box lies within both.
-        unsafe {
-            if std::mem::take(&mut buffers.fresh) {
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(
-                    &buffers.card,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
+        if shown().load(Ordering::Relaxed) && !self.lines.is_empty() && !self.failed {
+            let began = Instant::now();
+            // Not the title's: the frame recorder leaves it out.
+            #[cfg(feature = "diagnostics")]
+            let _ours = crate::replay::record::unrecorded();
+            let scale = scale(height);
+            if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+                // (What the card may still read stays: a picture's size changes once or twice in a run.)
+                std::mem::forget(self.buffers.take());
+                self.buffers = Buffers::new(host, format, scale);
+                self.failed = self.buffers.is_none();
+                self.changed = true;
             }
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&buffers.card),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: format,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: buffers.pitch,
+            if let Some(buffers) = &mut self.buffers {
+                if std::mem::take(&mut self.changed) {
+                    buffers.write(&self.lines);
+                }
+                let (w, h) = size(scale);
+                let dst_x = width.saturating_sub(w);
+                let list = &list.list;
+                // SAFETY: an open list and live resources; the box lies within both.
+                unsafe {
+                    if std::mem::take(&mut buffers.fresh) {
+                        list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
+                        list.ResourceBarrier(&[transition(
+                            &buffers.card,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                    }
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&buffers.card),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: 0,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: format,
+                                    Width: w,
+                                    Height: h,
+                                    Depth: 1,
+                                    RowPitch: buffers.pitch,
+                                },
+                            },
                         },
-                    },
-                },
-            };
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let part = D3D12_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w.min(width),
-                bottom: h.min(height),
-                back: 1,
-            };
-            let dst_x = width.saturating_sub(part.right);
-            list.CopyTextureRegion(&to, dst_x, 0, 0, &from, Some(&part));
+                    };
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(back),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                    };
+                    let part = D3D12_BOX {
+                        left: 0,
+                        top: 0,
+                        front: 0,
+                        right: w.min(width),
+                        bottom: h.min(height),
+                        back: 1,
+                    };
+                    list.CopyTextureRegion(&to, dst_x, 0, 0, &from, Some(&part));
+                }
+                self.cost += began.elapsed();
+            }
         }
-        self.cost += began.elapsed();
+        self.cursor.draw(host, list, back, (width, height), format);
     }
 }
 

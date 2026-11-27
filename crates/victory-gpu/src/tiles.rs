@@ -71,31 +71,6 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
-/// Now: such textures alive that show no level (no level is both held and
-/// given tiles, so every view of them reads zeros: a black/blank texture),
-/// and the bytes all their levels would take; since the start: levels given
-/// tiles on a full card by [`small_when_full_mb`].
-pub(crate) static BLANK: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
-/// `VICTORY_TILES_SMALL_WHEN_FULL_MB` (512 MB by default, after fxceless 0a40a00a):
-/// while the card has no room, an upload still gives tiles to the smallest held
-/// levels of its texture (packed mips, then standard mips up to [`SMALL_TILES`]
-/// tiles), as long as total allocated tiles stand under this many megabytes.
-/// Prevents missing wire-grate glass, black/blank arm textures, and zeroed
-/// roughness maps when 12 GB VRAM fills at 1440p.
-fn small_when_full_mb() -> u64 {
-    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MB.get_or_init(|| {
-        std::env::var("VICTORY_TILES_SMALL_WHEN_FULL_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(512, |mb| mb.min(1024))
-    })
-}
-
-/// Tiles a texture gets at most on a full card ([`small_when_full_mb`]): 1 MiB.
-const SMALL_TILES: u32 = 16;
-
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
@@ -348,8 +323,6 @@ impl Tiled {
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(full, Ordering::Relaxed);
         STATS[4].fetch_add(1, Ordering::Relaxed);
-        BLANK[0].fetch_add(1, Ordering::Relaxed);
-        BLANK[1].fetch_add(full, Ordering::Relaxed);
         Some(Tiled {
             given: Mutex::new(Given {
                 levels: vec![false; standard.len()],
@@ -405,46 +378,9 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        // On a full card, with `VICTORY_TILES_SMALL_WHEN_FULL_MB`, the
-        // smallest held levels get tiles so no texture goes blank/zeroed.
-        let small = if room { 0 } else { self.small_levels(held) };
-        if small != 0 {
-            BLANK[2].fetch_add(u64::from(small.count_ones()), Ordering::Relaxed);
-        }
-        let changed =
-            self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card | small });
+        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
-    }
-
-    /// Of the levels `held` (a bit a level), the smallest ones that may get
-    /// tiles on a full card ([`small_when_full_mb`]): the packed mips, then
-    /// standard mips from smallest up while under [`SMALL_TILES`].
-    fn small_levels(&self, held: u32) -> u32 {
-        let limit = small_when_full_mb() << 20;
-        if limit == 0 || STATS[2].load(Ordering::Relaxed) >= limit {
-            return 0;
-        }
-        let first_packed = self.standard.len() as u32;
-        let mut bits = 0u32;
-        let mut tiles = 0u32;
-        if self.packed > 0 {
-            let packed_bits = self.every_level() & !((1u32 << first_packed) - 1);
-            if held & packed_bits == 0 {
-                return 0;
-            }
-            bits |= packed_bits;
-            tiles += self.packed;
-        }
-        for level in (0..first_packed).rev() {
-            let tiles_here = self.standard[level as usize];
-            if held & (1 << level) == 0 || tiles + tiles_here > SMALL_TILES {
-                break;
-            }
-            tiles += tiles_here;
-            bits |= 1 << level;
-        }
-        if tiles > SMALL_TILES { 0 } else { bits }
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -633,6 +569,7 @@ impl Tiled {
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::host::tiles_mapped_on(queue);
             match level {
                 Some(level) => given.levels[level] = true,
                 None => given.packed = true,
@@ -651,15 +588,7 @@ impl Tiled {
             }
         };
         let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
-        let old = self.shown.swap(shown, Ordering::Relaxed);
-        if old == u32::MAX && shown != u32::MAX {
-            BLANK[0].fetch_sub(1, Ordering::Relaxed);
-            BLANK[1].fetch_sub(self.full, Ordering::Relaxed);
-        } else if old != u32::MAX && shown == u32::MAX {
-            BLANK[0].fetch_add(1, Ordering::Relaxed);
-            BLANK[1].fetch_add(self.full, Ordering::Relaxed);
-        }
-        old != shown
+        self.shown.swap(shown, Ordering::Relaxed) != shown
     }
 
     /// The first level a view of the texture may show; `None` while no
@@ -714,23 +643,19 @@ impl Drop for Tiled {
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
         STATS[2].fetch_sub(bytes, Ordering::Relaxed);
-        if *self.shown.get_mut() == u32::MAX {
-            BLANK[0].fetch_sub(1, Ordering::Relaxed);
-            BLANK[1].fetch_sub(self.full, Ordering::Relaxed);
-        }
     }
 }
 
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
 /// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels). `ResourceMinLODClamp` is measured from mip 0 of the
-/// resource, so moving the start of the view preserves that field (PR #1210).
+/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
+/// the effective minimum LOD stays at the same resource level.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
     if first >= levels {
         return;
     }
-    let clamp = |most: &mut u32, mips: &mut u32| {
+    let clamp = |most: &mut u32, mips: &mut u32, min_lod: &mut f32| {
         if first <= *most {
             return;
         }
@@ -739,17 +664,20 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
         }
+        if *min_lod > 0.0 {
+            *min_lod = (*min_lod - fewer as f32).max(0.0);
+        }
     };
     match desc.ViewDimension {
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: `ViewDimension` selects `Texture2D`.
             let view = unsafe { &mut desc.Anonymous.Texture2D };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: `ViewDimension` selects `Texture2DArray`.
             let view = unsafe { &mut desc.Anonymous.Texture2DArray };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels);
+            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
         }
         _ => {}
     }
@@ -785,16 +713,6 @@ pub(crate) fn status() {
         s[7],
         s[9],
         s[10],
-    );
-    let blank: Vec<u64> = BLANK.iter().map(|b| b.load(Ordering::Relaxed)).collect();
-    tracing::info!(
-        "textures with levels on demand that show no level now: {} of {} alive ({} MB full); \
-         small levels given tiles on a full card (VICTORY_TILES_SMALL_WHEN_FULL_MB={}): {}",
-        blank[0],
-        s[0],
-        blank[1] >> 20,
-        small_when_full_mb(),
-        blank[2],
     );
 }
 
@@ -1564,7 +1482,7 @@ void look() {
     }
 
     #[test]
-    fn show_from_preserves_resource_min_lod_for_2d_and_2d_array() {
+    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1584,7 +1502,7 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
+        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1606,7 +1524,7 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 1.5);
+        assert_eq!(varr.ResourceMinLODClamp, 0.0);
     }
 
     #[test]
@@ -1663,14 +1581,8 @@ void look() {
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;
         let (changed, waiting) = tiled.uploaded_on(host.queue(), &host.device, &tex, 1 << 1, false);
+        assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
-        if small_when_full_mb() == 0 {
-            assert!(!changed && waiting);
-            assert_eq!(tiled.given_bytes(), 0);
-        } else {
-            assert!(tiled.has_tiles(1));
-            assert_eq!(tiled.given_bytes(), TILE);
-            let _ = (changed, waiting);
-        }
+        assert_eq!(tiled.given_bytes(), 0);
     }
 }

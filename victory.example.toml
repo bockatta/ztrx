@@ -17,13 +17,3 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
-
-# Optional runtime graphics module (env: VICTORY_GRAPHICS_PRESET, hotkeys F4/F5/F6).
-# [graphics]
-# preset = 'balanced'   # cinema | balanced | performance | minimal
-# lighting = true       # ambient indirect light stand-in
-# shading = true        # false disables GTAO shading
-# shadows = true        # false disables screen-space contact shadows
-# ao_taps = 8           # 0, 4, 8, or 20
-# contact_steps = 4     # 0, 4, or 8
-# ceiling_floor = 0.52  # minimum hemisphere factor for indoor ceilings (0.0..1.0)

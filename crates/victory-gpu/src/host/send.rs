@@ -200,16 +200,11 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let mut copies = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        let mut words = 0usize;
-        for &(a, b) in ranges {
-            let len = b - a;
-            if short(&(a, b)) {
-                words += len / 4;
-            } else {
-                runs.push((a, at, len));
-                at += (len as u64).next_multiple_of(16);
-            }
+        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
+            runs.push((a, at, b - a));
+            at += ((b - a) as u64).next_multiple_of(16);
         }
+        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
         copies.push(Copy { runs, pairs: (at, words as u32) });
         at += (words as u64 * 8).next_multiple_of(16);
     }
@@ -222,9 +217,6 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        if copy.pairs.1 == 0 {
-            continue;
-        }
         // (80,000 runs of some words a frame: in pieces of work.)
         let mut to = memory.data + copy.pairs.0 as usize;
         for ranges in ranges.chunks(RUNS_AT_A_TIME) {
@@ -291,7 +283,7 @@ impl Own {
                 }
                 state = Some(write);
             }
-            let hashed = shadow.card_before_gpu() != 0;
+            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(was) = state
                 && hashed
                 && (!copy.runs.is_empty() || copy.pairs.1 > 0)
@@ -311,7 +303,7 @@ impl Own {
                 list.SetPipelineState(&pass.pso);
                 list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
-                    list.SetComputeRootUnorderedAccessView(2, shadow.gpu_base());
+                    list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
                     let (at, words) = copy.pairs;
                     let mut done = 0;

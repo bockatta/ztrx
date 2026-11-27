@@ -64,18 +64,6 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
-    /// True for `CS_ScreenProbes_ActivateRays`, which destroys light, shadows,
-    /// and reflections when run without ray tracing (Belobug 6986a571).
-    #[cfg(windows)]
-    pub(crate) probe_rays: bool,
-    /// True for `ps_sky_paraboloid_reflection`, which renders the sky dome used
-    /// to track time-of-day exposure for the indirect-light stand-in (Belobug e48eb83e).
-    #[cfg(windows)]
-    pub(crate) draws_sky: bool,
-    /// True for any `PS_BakeDecorations*` character skin/tattoo/decoration bake shader
-    /// (354 variants in the title — catching all of them prevents stale/rainbow arm bakes).
-    #[cfg(windows)]
-    pub(crate) is_bake: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -128,21 +116,6 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
-                #[cfg(windows)]
-                probe_rays: stage == "compute"
-                    && bytes
-                        .windows(b"CS_ScreenProbes_ActivateRays".len())
-                        .any(|w| w == b"CS_ScreenProbes_ActivateRays"),
-                #[cfg(windows)]
-                draws_sky: stage == "pixel"
-                    && bytes
-                        .windows(crate::ambient::SKY.len())
-                        .any(|w| w == crate::ambient::SKY),
-                #[cfg(windows)]
-                is_bake: stage == "pixel"
-                    && bytes
-                        .windows(b"PS_BakeDecorations".len())
-                        .any(|w| w == b"PS_BakeDecorations"),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -340,19 +313,6 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
-/// Whether `this` is `CS_ScreenProbes_ActivateRays` and should be skipped
-/// while the ray-tracing structure builder is off (Belobug 6986a571: running
-/// it with no rays behind it destroys light, shadows, and reflections).
-/// Set `VICTORY_RUN_PROBE_RAYS=1` to force it to run.
-#[cfg(windows)]
-pub(crate) fn is_idle_probe_rays(this: This) -> bool {
-    static FORCE_RUN: OnceLock<bool> = OnceLock::new();
-    if *FORCE_RUN.get_or_init(|| std::env::var_os("VICTORY_RUN_PROBE_RAYS").is_some_and(|v| v == "1")) {
-        return false;
-    }
-    !this.is_null() && !builder_runs() && pipeline(this).shaders.iter().any(|s| s.probe_rays)
-}
-
 /// A stage of the builder was dropped after all: none runs for the rest of
 /// this frame and the next (what it fed is not there).
 #[cfg(windows)]
@@ -499,25 +459,17 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
-/// LOCAL (fxceless a35c557393): as [`host_pipeline`], for a draw into views
-/// of the formats `bound`: if one has another format than the pipeline
-/// declares for its slot, the host pipeline made for the bound formats.
-#[cfg(windows)]
-pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
-    if this.is_null() {
-        return None;
-    }
-    let p = &pipeline(this).host;
-    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
-        return make::for_formats(p, bound);
-    }
-    make::ready(p)
-}
-
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Draws and dispatches asked of pipelines left out on purpose since the last
+/// call (ray-tracing passes without the structure builder).
+#[cfg(windows)]
+pub(crate) fn take_left_out() -> u64 {
+    make::take_left_out()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -525,32 +477,13 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics (comma/whitespace
-/// separated, or `@<path>` to load a hash list file like `rt_off_hashes.txt`).
-#[cfg(windows)]
-fn parse_skip_hashes(value: &str) -> std::collections::HashSet<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed == "0" {
-        return std::collections::HashSet::new();
-    }
-    let owned;
-    let body = if let Some(path) = trimmed.strip_prefix('@') {
-        match std::fs::read_to_string(path.trim()) {
-            Ok(text) => {
-                owned = text;
-                owned.as_str()
-            }
-            Err(e) => {
-                tracing::warn!(path = path.trim(), error = %e, "could not read VICTORY_SKIP_PIPELINES file");
-                return std::collections::HashSet::new();
-            }
-        }
-    } else {
-        trimmed
-    };
-    body.split(|c: char| c == ',' || c.is_ascii_whitespace())
+/// Shader hashes as printed in the pipeline diagnostics.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_skip_hashes(value: &str) -> Vec<String> {
+    value
+        .split(',')
         .map(str::trim)
-        .filter(|hash| !hash.is_empty() && !hash.starts_with('#'))
+        .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
@@ -565,16 +498,12 @@ fn parse_skip_hashes(value: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        let set = parse_skip_hashes(&value);
-        if !set.is_empty() {
-            tracing::info!(count = set.len(), "skipping shaders listed by VICTORY_SKIP_PIPELINES");
-        }
-        set
+        parse_skip_hashes(&value)
     });
     if hashes.is_empty() {
         return None;
@@ -585,7 +514,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }

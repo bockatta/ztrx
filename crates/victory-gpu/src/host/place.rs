@@ -119,6 +119,7 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
                 let (at, len) = staging.memory();
                 touches(&ranges, at, at + len)
             }
+            &Step::Plane((at, len), _) => touches(&ranges, at, at.saturating_add(len)),
             Step::Host(_, (from, to)) => touches(&ranges, *from, *to),
             Step::Placed(p) => p.from.is_some() && touches(&ranges, p.src, p.src + p.len),
             _ => false,
@@ -201,20 +202,10 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
-        let own = shaders_own(src, len);
-        let to = match crate::shadow::peek(dst as u64, len as u64) {
-            Some(s) => Some(s),
-            // When shaders wrote the source (e.g. a load-time GPU geometry decode
-            // pass writing into a scratch buffer before CopyBufferRegion copies
-            // decoded vertex streams into a brand-new geometry buffer), create the
-            // destination host copy now so the copy runs on the GPU in list order
-            // instead of falling back to a pre-submission CPU copy of raw encoded bytes.
-            None if own.is_some() => crate::shadow::find(dst as u64, len as u64),
-            None => None,
-        };
-        let Some(to) = to.filter(|s| !s.in_place()) else {
+        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
             return false;
         };
+        let own = shaders_own(src, len);
         let scratch = match &own {
             Some(_) => None,
             None if len <= MOST => match self.scratch_at(len as u64) {
@@ -258,8 +249,6 @@ impl HostList {
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
         let mut deferred = self.deferred();
-        deferred.has_placed = true;
-        deferred.has_blocking = true;
         deferred.copies.push(Step::Placed(Placed {
             dst,
             src,

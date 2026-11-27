@@ -29,49 +29,31 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_ONCE=1`: one bounce of the title's own light, without the
+//! stand-in's light coming back to it ([`once`]).
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! Reflections are traced too, at half the picture's size: rays the
+//! title's screen-space march resolves (`CS_ResolveScreenSpace`) take the
+//! light seen on screen; the others go to the structures, find nothing, and
+//! `CS_RayMiss` gives each the sky's light from the sky's cube maps (in a
+//! cutscene frame, capture haze2: 10 to 30 against 0.01 to 0.1 for the room
+//! the eyes and floors are in, and blue). `VICTORY_AMBIENT_SPECULAR` puts in,
+//! right after that program, the same estimate taken along the reflected
+//! direction ([`Role::Miss`]); the screen-space resolve that comes next
+//! still writes what it found over it.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::core::s;
 
 use crate::host::{HostList, host};
-use crate::object::This;
-
-/// The pixel program that renders the sky dome as the title reflects it:
-/// `128x128 R16G16B16A16_FLOAT` in the title's own linear HDR light units
-/// (Belobug e48eb83e / 4f62c2a5). Used to match indirect ambient exposure
-/// across noon interiors (cafe), sunset (prison), and night automatically.
-pub(crate) const SKY: &[u8] = b"ps_sky_paraboloid_reflection";
-
-static SKY_IMAGE: Mutex<Option<Arc<crate::resource::HostTexture>>> = Mutex::new(None);
-
-/// Records the host copy of the title's sky dome texture when drawn.
-pub(crate) fn sky_drawn(image: usize) {
-    let Some(copy) = crate::resource::host_copy(image as This) else {
-        return;
-    };
-    // SAFETY: a live host texture.
-    let d = unsafe { copy.texture.GetDesc() };
-    if d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
-        return;
-    }
-    let mut held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
-    if !held.as_ref().is_some_and(|h| Arc::ptr_eq(h, &copy)) {
-        *held = Some(copy);
-    }
-}
-
-/// Sky-dome exposure curve from the live graphics module (or `None` if disabled).
-fn sky_follow(g: &crate::graphics::Settings) -> Option<[f32; 3]> {
-    g.sky_enabled.then_some([g.sky_gain, g.sky_least, g.sky_power])
-}
 
 /// Programs of the title the stand-in follows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,9 +65,9 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
-    /// Writes the title's reflections (`CS_UpdateHistory`, Belobug c3bd5612):
-    /// without rays, glossy surfaces indoors get an unoccluded sky glare.
-    Reflect,
+    /// Gives the reflection rays that found nothing the sky's light
+    /// (`CS_RayMiss`, not `CS_RayMiss_Volumetrics` nor the screen probes').
+    Miss,
 }
 
 /// The program's part in this, by its name in the container.
@@ -97,11 +79,19 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
-    } else if has(b"UpdateHistory") {
-        Some(Role::Reflect)
+    } else if is_miss(container) {
+        Some(Role::Miss)
     } else {
         None
     }
+}
+
+/// `CS_RayMiss_` and the eight hex digits of a variant's hash.
+fn is_miss(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_RayMiss_";
+    container.windows(NAME.len() + 9).any(|w| {
+        w.starts_with(NAME) && w[NAME.len()..NAME.len() + 8].iter().all(u8::is_ascii_hexdigit) && w[NAME.len() + 8] == b'_'
+    })
 }
 
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
@@ -112,10 +102,15 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
-/// Where `CS_UpdateHistory` writes reflections (R9G9B9E5 as R32_UINT).
-pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// Where the miss program writes the reflected light (R11G11B10, half the
+/// picture's size) and where it reads the depth it is given (a 32-bit depth
+/// of the picture's size).
+pub(crate) const MISS_LIGHT: (u8, u32) = (1, 104);
+pub(crate) const MISS_DEPTH: (u8, u32) = (0, 1000);
+/// The miss program's first root constant: which surfaces its rays are of.
+pub(crate) const MISS_OPAQUE: u32 = 0;
+pub(crate) const MISS_ALPHA: u32 = 1;
 
-#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
     Off,
@@ -123,7 +118,6 @@ enum Set {
     Constant(f32),
 }
 
-#[cfg(test)]
 fn parse(set: &str) -> Set {
     let set = set.trim();
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
@@ -133,22 +127,102 @@ fn parse(set: &str) -> Set {
     }
 }
 
-/// Opt-in hybrid mode (`VICTORY_AMBIENT_WITH_RT=1`): allow subtle ambient
-/// bounce + reflection soft-knee to fill unmapped indoor voids alongside the
-/// ray-tracing structure builder (`VICTORY_BVH_BUILDER=1`).
-fn with_rt() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_WITH_RT").is_some_and(|v| v == "1"))
+fn set() -> Set {
+    static SET: OnceLock<Set> = OnceLock::new();
+    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
-/// Whether the stand-in is on: enabled in [`crate::graphics`], and either the
-/// RT structure builder is off or hybrid `VICTORY_AMBIENT_WITH_RT=1` is active.
+/// Whether a stand-in is on (for the diffuse light or for reflections):
+/// set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    crate::graphics::current().ambient_enabled && (!crate::pipeline::builder_runs() || with_rt())
+    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+}
+
+/// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found
+/// nothing take `share` of the estimate along the reflected direction
+/// instead of the sky's light; `sky` (0 to 1, 0 if not given) of them stays
+/// the title's sky, made no brighter than the estimate. Unset or 0: the
+/// title's sky.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Specular {
+    share: f32,
+    sky: f32,
+}
+
+fn parse_specular(set: &str) -> Option<Specular> {
+    let mut parts = set.split(',').map(|t| t.trim().parse::<f32>().ok().filter(|v| v.is_finite()));
+    let share = parts.next().flatten().filter(|v| *v > 0.0)?;
+    let sky = parts.next().flatten().map_or(0.0, |v| v.clamp(0.0, 1.0));
+    Some(Specular { share, sky })
+}
+
+fn specular() -> Option<Specular> {
+    static SET: OnceLock<Option<Specular>> = OnceLock::new();
+    *SET.get_or_init(|| parse_specular(&std::env::var("VICTORY_AMBIENT_SPECULAR").unwrap_or_default()))
+}
+
+/// `VICTORY_AMBIENT_ONCE=1`: the estimate is one bounce of the light the
+/// title's own lighting put there, not of the stand-in's too.
+///
+/// The light the visible surfaces send out (the estimate's source) is that of
+/// the frame before, which the stand-in had raised: its own light comes back
+/// to it, reflected. With a share `level` of what surfaces send out, and
+/// surfaces sending out a share `a` of the light they get (`e` their own),
+/// the light settles at `level * e / (1 - level * a)` instead of
+/// `level * (a * l + e)`: at 0.8 and walls that send out 0.6, 1.9 times
+/// one bounce, more near pale surfaces and lamps (the overexposed rooms).
+/// With this switch the raise notes, at the 25 places of each cell that the
+/// next keep reads, which share of the light there is the title's own; the
+/// keep counts each place's light by that share. Light that is the
+/// surface's own (lamps) is counted down as well where the stand-in raised
+/// it: shortcut, no albedo to tell the two apart.
+fn once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// The most the air scatters, as a multiple of the light around
+/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+fn air() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
+/// Maximum ratio of the title's own probe output to keep over our directional
+/// estimate (`VICTORY_AMBIENT_MOST=<ratio>`, default `0.0`: clean overwrite so
+/// uninitialized screen-probe sky blocks never bleed a bright white glare box
+/// onto characters next to bright windows; set e.g. `4.0` to retain sky probes).
+fn most_keep() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Strength and radius of the creases' shade.
+fn shade() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let mut shade = [1.0, 0.6];
+        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
+        for (to, v) in shade.iter_mut().zip(set.split(',')) {
+            if let Ok(v) = v.trim().parse() {
+                *to = v;
+            }
+        }
+        shade
+    })
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -157,18 +231,15 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float reflect_floor;
-    uint ao_taps; uint contact_steps; uint gather_step; float ceiling_floor;
+    float follow; float most; float air; float once;
 };
 Texture2D<float> depth : register(t0);
-// Cells:
-//   [0 .. CELLS)                 = radiance RGB (a = 1)
-//   [CELLS]                      = slow temporal mean radiance RGB
-//   [CELLS + 1 .. 2*CELLS + 1)   = view-space position XYZ, w = z^2 area weight
-//   [2*CELLS + 1 .. 3*CELLS + 1) = view-space emitter surface normal XYZ
-//   [3*CELLS + 1]                = sky-dome exposure-matched ambient RGB (a = 1 when active)
+// Cells: the light they send out (then, at CELLS, the slow mean), from
+// CELLS + 1 on where they are, from SHARES on the share of the title's own
+// light at each of the 25 places of a cell the keep reads (x; y: written).
+#define SHARES (2 * CELLS + 1)
 RWStructuredBuffer<float4> cells : register(u1);
-// Three a point: red, green and blue, each a mean (w) and a direction (xyz).
+// Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
@@ -178,17 +249,6 @@ float3 seen(int2 p, float2 size) {
     float z = min(near / max(d, 1e-7), 1000.0);
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
-}
-
-// Reconstruct view-space surface normal from depth with silhouette-preserving diffs.
-float3 surface_normal(int2 p, float2 size, float3 c) {
-    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
-    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
-    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
-    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
-    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
-    if (dot(n, c) > 0.0) n = -n;
-    return n;
 }
 
 #ifdef KEEP
@@ -204,7 +264,10 @@ void keep(uint3 at : SV_DispatchThreadID) {
         float3 c = max(radiance[p], 0.0);
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
-        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+        c /= max(1.0, dot(c, LUMA) / 20.0);
+        // Not the stand-in's own light, reflected (`once`).
+        float4 share = cells[SHARES + (at.y * CX + at.x) * 25 + y * 5 + x];
+        sum += once > 0.0 && share.y > 0.0 ? c * saturate(share.x) : c;
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
@@ -224,12 +287,8 @@ void mean() {
 [numthreads(8, 4, 1)]
 void place(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
-    int2 q = int2((float2(at.xy) + 0.5) * size / float2(CX, CY));
-    float3 p = seen(q, size);
-    float3 n = surface_normal(q, size, p);
-    uint idx = at.y * CX + at.x;
-    cells[CELLS + 1 + idx] = float4(p, p.z * p.z);
-    cells[2 * CELLS + 1 + idx] = float4(n, 1.0);
+    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
+    cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
 }
 #endif
 
@@ -239,20 +298,16 @@ void place(uint3 at : SV_DispatchThreadID) {
 void gather(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
-    float r2 = 0.10 + 0.0014 * p.z * p.z;
+    float r2 = 0.25 + 0.0025 * p.z * p.z;
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    uint step = max(gather_step, 1u);
-    for (uint i = 0; i < CELLS; i += step) {
+    for (uint i = 0; i < CELLS; i++) {
         float4 c = cells[CELLS + 1 + i];
-        float3 nc = cells[2 * CELLS + 1 + i].xyz;
         float3 L = cells[i].rgb;
         float3 d = c.xyz - p;
         float dd = dot(d, d);
+        float w = c.w / (dd + r2);
         float3 dir = d / sqrt(dd + 0.25 * r2);
-        // Physical emitter facing: surfaces bounce light forward into the room they face.
-        float emit_facing = saturate(dot(-dir, nc) * 0.85 + 0.15);
-        float w = c.w * emit_facing / (dd + r2);
         whole += w;
         toward += w * dir;
         light += w * L;
@@ -292,6 +347,62 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef REFLECT
+RWTexture2D<float3> reflected : register(u0);
+// Each texel of the reflections' image (half the picture's size): the light
+// the points around send along the reflected direction, as `raise` takes it
+// along the normal; `level` is the share, `constant` the share of the
+// title's sky kept, made no brighter than that.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void reflect_light(uint3 at : SV_DispatchThreadID) {
+    uint w, h;
+    reflected.GetDimensions(w, h);
+    if (at.x >= w || at.y >= h) return;
+    float2 size = float2(width, height);
+    int2 p = int2((float2(at.xy) + 0.5) * size / float2(w, h));
+    float3 c = seen(p, size);
+    // Nothing is reflected by the sky.
+    if (c.z >= 999.0) return;
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    float3 v = normalize(c);
+    float3 ray = v - 2.0 * dot(v, n) * n;
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float wgt = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += wgt * points[at0];
+        sg += wgt * points[at0 + 1];
+        sb += wgt * points[at0 + 2];
+        sum += wgt;
+    }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    // Radiance from the first moments: three times the direction's share
+    // for an even spread of directions, a little less for a smooth image.
+    float3 found = all + 2.0 * float3(dot(sr.xyz, ray), dot(sg.xyz, ray), dot(sb.xyz, ray)) / sum;
+    found = clamp(found, 0.1 * all, 3.0 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level;
+    found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
+    float3 was = reflected[at.xy];
+    was = any(isnan(was)) || any(isinf(was)) ? 0.0 : max(was, 0.0);
+    float has = dot(was, LUMA);
+    was *= min(1.0, dot(found, LUMA) / max(has, 1e-6));
+    reflected[at.xy] = lerp(found, was, constant);
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -313,65 +424,28 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
     float3 c = seen(p, size);
-    float3 n = surface_normal(p, size, c);
-    // Configurable dual-scale GTAO / contact + architectural corner AO + bent normal.
+    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+    float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+    float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
+    if (dot(n, c) > 0.0) n = -n;
+    // How open it is (as in beloooo's cd9f78ce).
     float open = 1.0;
-    float3 bent_n = n;
+    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
-    if (strength > 0.0 && ao_taps > 0u && c.z < 350.0) {
-        float px_base = radius * size.y / (2.0 * tan_y * c.z);
-        float3 bent = float3(0.0, 0.0, 0.0);
-        // Scale 1: Tight contact AO (4 or 8 taps depending on graphics preset).
-        float r_tight = max(radius * 0.35, 0.14);
-        float px_tight = min(px_base * 0.35, 36.0);
-        float sum_tight = 0.0;
-        int nt = int(min(ao_taps, 8u));
-        if (px_tight >= 1.25 && nt > 0) {
-            for (int i = 0; i < nt; i++) {
-                float a = i * 2.399963 + noise * 6.2831853;
-                float2 o = float2(cos(a), sin(a)) * (sqrt((float(i) + 0.5) / float(nt)) * px_tight);
-                float3 v = seen(p + int2(round(o)), size) - c;
-                float vv = dot(v, v);
-                float inv_d = rsqrt(vv + 1e-6);
-                float over = dot(v, n) - 0.003 * c.z - 0.005;
-                float falloff = saturate(1.0 - vv / (r_tight * r_tight));
-                float occ = max(over, 0.0) * inv_d * falloff;
-                sum_tight += occ;
-                bent += (v * inv_d) * (1.0 - occ);
-            }
-            sum_tight /= float(nt);
+    if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
+        float sum = 0.0;
+        const int N = 12;
+        for (int i = 0; i < N; i++) {
+            float a = i * 2.399963 + noise * 6.2831853;
+            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
+            float3 v = seen(p + int2(round(o)), size) - c;
+            float vv = dot(v, v);
+            float over = dot(v, n) - 0.004 * c.z - 0.005;
+            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
         }
-        // Scale 2: Medium architectural corner AO (only when ao_taps > 8, e.g. Cinema preset).
-        float r_wide = radius * 1.15;
-        float px_wide = min(px_base * 1.15, 110.0);
-        float sum_wide = 0.0;
-        int nw = ao_taps > 8u ? int(min(ao_taps - 8u, 12u)) : 0;
-        if (px_wide >= 2.0 && nw > 0) {
-            for (int i = 0; i < nw; i++) {
-                float a = (i + 8) * 2.399963 + noise * 6.2831853;
-                float2 o = float2(cos(a), sin(a)) * (sqrt((float(i) + 0.5) / float(nw)) * px_wide);
-                float3 v = seen(p + int2(round(o)), size) - c;
-                float vv = dot(v, v);
-                float inv_d = rsqrt(vv + 1e-6);
-                float over = dot(v, n) - 0.005 * c.z - 0.010;
-                float falloff = saturate(1.0 - vv / (r_wide * r_wide));
-                float occ = max(over, 0.0) * inv_d * falloff;
-                sum_wide += occ;
-                bent += (v * inv_d) * (1.0 - occ);
-            }
-            sum_wide /= float(nw);
-        }
-        float ao_tight = saturate(1.0 - strength * 1.75 * sum_tight);
-        float ao_wide  = nw > 0 ? saturate(1.0 - strength * 1.65 * sum_wide) : ao_tight;
-        float dist_fade = saturate(1.0 - (c.z - 220.0) / 130.0);
-        // Deep physical multi-bounce AO (0.11) for grounded under-bunk, table, arm,
-        // chin/collar, and architectural corner shadows; downward-facing ceilings stay
-        // softly shaded (0.44) so they never crush to pitch black.
-        float ao_floor = n.y < -0.55 ? 0.44 : 0.11;
-        float raw_ao = saturate(ao_tight * 0.55 + ao_wide * 0.45);
-        float ao_shaped = pow(raw_ao, 1.18);
-        open = lerp(1.0, lerp(ao_floor, 1.0, ao_shaped), dist_fade);
-        bent_n = normalize(n + bent * (0.045 * dist_fade));
+        open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
     if (constant > 0.0) {
@@ -379,209 +453,62 @@ void raise(uint3 at : SV_DispatchThreadID) {
         light[p] = pack(found);
         return;
     }
-    float3 all;
-    float3 dir_sh;
-    float3 sh_vec = float3(0.0, 0.0, 0.0);
-    if (gather_step == 0u) {
-        // Minimal preset: fast sky/room-mean fill without SH1 point lookups.
-        all = max(cells[CELLS].rgb, float3(0.02, 0.02, 0.02));
-        dir_sh = all;
-    } else {
-        // Between the four points around, those at its own depth first; which
-        // four is dithered a little.
-        float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
-        int2 g0 = int2(floor(g));
-        float2 f = g - float2(g0);
-        float4 sr = 0, sg = 0, sb = 0;
-        float sum = 0;
-        for (int k = 0; k < 4; k++) {
-            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-            float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
-            float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-            float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-            uint at0 = (q.y * PX + q.x) * 3;
-            sr += w * points[at0];
-            sg += w * points[at0 + 1];
-            sb += w * points[at0 + 2];
-            sum += w;
-        }
-        all = float3(sr.w, sg.w, sb.w) / sum;
-        // Directional SH1 bounce evaluated along bent normal for grounded colored bounce.
-        dir_sh = all + 1.65 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
-        dir_sh = clamp(dir_sh, 0.12 * all, 2.9 * all);
-        sh_vec = (sr.xyz * LUMA.r + sg.xyz * LUMA.g + sb.xyz * LUMA.b) / sum;
+    // Between the four points around, those at its own depth first; which
+    // four is dithered a little.
+    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    int2 g0 = int2(floor(g));
+    float2 f = g - float2(g0);
+    float4 sr = 0, sg = 0, sb = 0;
+    float sum = 0;
+    for (int k = 0; k < 4; k++) {
+        int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+        uint at0 = (q.y * PX + q.x) * 3;
+        sr += w * points[at0];
+        sg += w * points[at0 + 1];
+        sb += w * points[at0 + 2];
+        sum += w;
     }
-    float3 bounce = lerp(dir_sh, cells[CELLS].rgb, 0.07) * level;
-    // Screen-space directional contact shadows (configurable steps; disabled on
-    // downward-facing ceilings n.y <= -0.55 so ceilings never self-shadow black).
-    float dir_shadow = 1.0;
-    if (strength > 0.0 && contact_steps > 0u && n.y > -0.55 && c.z < 120.0) {
-        float sh_len = length(sh_vec);
-        float3 up_bias = float3(0.0, 0.78, -0.32);
-        float3 l_dir = sh_len > 1e-4 ? (sh_vec / sh_len) : up_bias;
-        float3 ray_dir = normalize(lerp(up_bias, l_dir, saturate(sh_len / max(dot(all, LUMA) * 0.45, 1e-4))));
-        float aspect = size.x / size.y;
-        float occ_max = 0.0;
-        float max_reach = min(radius * 1.35, 1.15);
-        float thick = max(0.04, 0.018 * c.z);
-        int ns = int(min(contact_steps, 8u));
-        for (int s = 0; s < ns; s++) {
-            float frac_s = (float(s) + 0.35 + 0.65 * noise) / float(ns);
-            float dist_m = max_reach * (frac_s * frac_s);
-            float3 sp = c + ray_dir * dist_m;
-            if (sp.z <= near) break;
-            float2 sndc = float2(sp.x / (sp.z * tan_y * aspect), -sp.y / (sp.z * tan_y));
-            int2 sq = int2((sndc * 0.5 + 0.5) * size);
-            if (sq.x < 0 || sq.y < 0 || sq.x >= int(width) || sq.y >= int(height)) break;
-            float scene_z = seen(sq, size).z;
-            float dz = sp.z - scene_z;
-            if (dz > 0.015 && dz < thick + 0.35 * dist_m) {
-                float weight = saturate(1.0 - frac_s * 0.72) * saturate(1.0 - dz / (thick + 0.45 * dist_m));
-                occ_max = max(occ_max, weight);
-            }
-        }
-        float s_fade = saturate(1.0 - (c.z - 60.0) / 60.0);
-        dir_shadow = lerp(1.0, lerp(1.0, 0.30, occ_max * saturate(strength * 0.80)), s_fade);
-    }
-    float4 sky_entry = cells[3 * CELLS + 1];
-    float hemi_floor = clamp(ceiling_floor, 0.36, 0.85);
-    if (sky_entry.a > 0.0) {
-        // Calibrated sky-dome indirect floor modulated by directional SH1 ratio,
-        // hemisphere normal orientation, and distance fade so GTA VI's real sun
-        // and interior shadows hold deep cinematic contrast.
-        float all_luma = max(dot(all, LUMA), 1e-4);
-        float3 dir_ratio = clamp(dir_sh / all_luma, 0.42, 1.90);
-        float3 room_avg = max(cells[CELLS].rgb, float3(0.006, 0.0059, 0.0056));
-        float room_luma = max(dot(room_avg, LUMA), 0.006);
-        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.55, 1.55), 0.45);
-        float hemi = lerp(hemi_floor, 1.0, saturate(bent_n.y * 0.5 + 0.5));
-        float indoor_fill = lerp(1.0, 0.48, saturate((c.z - 12.0) / 18.0));
-        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.65)
-            * hemi * indoor_fill * max(level, 0.72);
-        bounce = max(bounce, sky_fill);
-    } else if (reflect_floor > 0.0) {
-        float3 room_avg = max(cells[CELLS].rgb, float3(0.008, 0.0078, 0.0075));
-        float room_luma = max(dot(room_avg, LUMA), 0.008);
-        float3 room_tint = lerp(float3(1.0, 0.98, 0.94), clamp(room_avg / room_luma, 0.4, 1.8), 0.55);
-        float hemi = lerp(hemi_floor, 1.0, saturate(bent_n.y * 0.5 + 0.5));
-        bounce = max(bounce, room_tint * reflect_floor * hemi);
-    }
-    found = bounce * open * dir_shadow;
-    if (most <= 0.0) {
-        light[p] = pack(found);
-        return;
-    }
+    float3 all = float3(sr.w, sg.w, sb.w) / sum;
+    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.2 * all, 2.5 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
-    // Keep the title's own screen-space/RT traced bounce & sky light where valid,
-    // modulated gently by contact shadow contrast.
-    float top = max(dot(found, LUMA) * most, 1e-6);
-    float has = dot(was, LUMA);
-    was *= min(1.0, top / max(has, 1e-6)) * lerp(1.0, open * dir_shadow, 0.55);
-    light[p] = pack(max(was, found));
-}
-#endif
-
-#ifdef SKY
-#define RS_SKY "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), UAV(u1)"
-cbuffer SkySet : register(b0) {
-    float sky_gain; float sky_least; float sky_power; float sky_follow;
-};
-Texture2DArray<float4> sky_tex : register(t0);
-[RootSignature(RS_SKY)]
-[numthreads(1, 1, 1)]
-void sky_mean() {
-    uint sw, sh, slices;
-    sky_tex.GetDimensions(sw, sh, slices);
-    if (sw == 0 || sh == 0) {
-        cells[3 * CELLS + 1] = float4(0.0, 0.0, 0.0, 0.0);
-        return;
+    float3 now = found;
+    if (most > 0.0) {
+        // What the program left counts as far as it can be true: the sky's light
+        // outdoors, not the blocks of other memory.
+        float top = max(dot(found, LUMA) * most, 1e-6);
+        float has = dot(was, LUMA);
+        was *= min(1.0, top / max(has, 1e-6));
+        now = max(was, found);
     }
-    float3 sum = 0.0;
-    const int N = 8;
-    for (int y = 0; y < N; y++) {
-        for (int x = 0; x < N; x++) {
-            float3 there = sky_tex.Load(int4((x * 2 + 1) * sw / (N * 2), (y * 2 + 1) * sh / (N * 2), 0, 0)).rgb;
-            there = any(isnan(there)) || any(isinf(there)) ? 0.0 : there;
-            sum += clamp(there, 0.0, 8.0);
+    light[p] = pack(now);
+    if (once > 0.0) {
+        // At the places the next keep reads, the share of the light that is
+        // the title's own.
+        float2 gc = (float2(p) + 0.5) / size * float2(CX, CY);
+        uint2 cell = min(uint2(gc), uint2(CX - 1, CY - 1));
+        uint2 k = min(uint2((gc - float2(cell)) * 5.0), uint2(4, 4));
+        uint2 q = uint2((float2(cell) + (float2(k) + 0.5) / 5.0) * size / float2(CX, CY));
+        if (q.x == uint(p.x) && q.y == uint(p.y)) {
+            float share = dot(was, LUMA) / max(dot(now, LUMA), 1e-6);
+            cells[SHARES + (cell.y * CX + cell.x) * 25 + k.y * 5 + k.x] = float4(share, 1.0, 0.0, 0.0);
         }
     }
-    float3 mean = sum / (N * N);
-    float m = dot(mean, LUMA);
-    const float3 NIGHT = float3(0.6, 0.75, 1.0);
-    float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), mean / max(m, 1e-6), 0.45), saturate(m / 0.05));
-    float3 now = hue * (sky_gain * pow(max(m, 0.0), sky_power) + sky_least);
-    float4 was = cells[3 * CELLS + 1];
-    cells[3 * CELLS + 1] = float4(was.a > 0.0 ? lerp(was.rgb, now, sky_follow) : now, 1.0);
-}
-#endif
-
-#ifdef REFLECT
-RWTexture2D<uint> reflected : register(u0);
-float3 unpack_r(uint v) {
-    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
-}
-uint pack_r(float3 c) {
-    c = clamp(c, 0.0, 65408.0);
-    float top = max(c.r, max(c.g, c.b));
-    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
-    float scale = exp2(float(24 - e));
-    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
-    uint3 m = min(uint3(c * scale + 0.5), 511u);
-    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
-}
-[RootSignature(RS)]
-[numthreads(8, 8, 1)]
-void clamp_reflect(uint3 at : SV_DispatchThreadID) {
-    if (at.x >= width || at.y >= height) return;
-    int2 p = int2(at.xy);
-    float3 c = unpack_r(reflected[p]);
-    float4 sky_entry = cells[3 * CELLS + 1];
-    float3 rad_base = cells[CELLS].rgb * level;
-    // Scale reflection ceiling to the ACTUAL room radiance (`rad_base`) rather
-    // than `max(rad_base, sky_entry)` — indoors `sky_entry` is the bright outdoor
-    // sky (10-15x brighter than a dim dorm room), which let unoccluded RT sky
-    // misses pass through as sharp white chrome/oily blobs on skin and tables!
-    float3 base = constant > 0.0
-        ? float3(1.0, 0.98, 0.94) * constant
-        : (sky_entry.a > 0.0
-            ? min(max(rad_base, sky_entry.rgb * 0.18 * level), rad_base * 1.4 + 0.008)
-            : rad_base);
-    float base_luma = max(dot(base, LUMA), 1e-4);
-    float has = dot(c, LUMA);
-    if (air > 0.0) {
-        // Real SSR stays near local room luminance; unoccluded RT sky-misses jump
-        // sharply above `base_luma` right at the roughness threshold, painting flat
-        // white oily/chrome patches across skin and painted tables indoors.
-        // Compress strictly proportionally to `base_luma` (zero fixed 0.02 floor!)
-        // and roll strong sky-miss spikes back to subtle warm room reflection.
-        float knee = air * base_luma;
-        if (has > knee) {
-            float ratio = has / base_luma;
-            float sky_miss = saturate((ratio - 1.35) / 2.0);
-            float excess = has - knee;
-            float soft = knee + excess / (1.0 + excess / max(knee * 0.12, 1e-5));
-            float3 clamped = c * (soft / max(has, 1e-6));
-            float3 room_refl = base * (air * 0.45);
-            c = lerp(clamped, min(clamped, room_refl), sky_miss * 0.90);
-        }
-    }
-    if (reflect_floor > 0.0) {
-        c = max(c, base * reflect_floor);
-    }
-    reflected[p] = pack_r(c);
 }
 #endif
 "#;
 
-/// Bytes of the cells' buffer (radiance + mean + positions + emitter normals + sky exposure) and of the points'.
+/// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (3 * CELLS + 2) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 1 + 25 * CELLS) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
-const SKY_SLOTS: u32 = 32;
 
 struct Pass {
     root: ID3D12RootSignature,
-    sky_root: ID3D12RootSignature,
     keep: ID3D12PipelineState,
     mean: ID3D12PipelineState,
     place: ID3D12PipelineState,
@@ -589,12 +516,6 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     reflect: ID3D12PipelineState,
-    sky_mean: ID3D12PipelineState,
-    sky_heap: ID3D12DescriptorHeap,
-    sky_cpu: usize,
-    sky_gpu: u64,
-    sky_step: u32,
-    sky_next: AtomicU32,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -626,36 +547,10 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
-    let reflect = pipeline("REFLECT", s!("clamp_reflect"))?;
-    let sky_code = crate::host::compile(&format!("#define SKY\n{SOURCE}"), s!("sky_mean"), s!("cs_5_1"))?;
-    // SAFETY: self-contained root signature inside compiled bytecode; plain D3D12 creations.
-    let (sky_root, sky_mean, sky_heap, sky_cpu, sky_gpu, sky_step) = unsafe {
-        let sky_root: ID3D12RootSignature = device.CreateRootSignature(0, &sky_code)?;
-        let sky_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&sky_root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: sky_code.as_ptr().cast(),
-                BytecodeLength: sky_code.len(),
-            },
-            ..Default::default()
-        };
-        let sky_mean = device.CreateComputePipelineState(&sky_desc)?;
-        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        let sky_heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-            Type: kind,
-            NumDescriptors: SKY_SLOTS,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            NodeMask: 0,
-        })?;
-        let sky_cpu = sky_heap.GetCPUDescriptorHandleForHeapStart().ptr;
-        let sky_gpu = sky_heap.GetGPUDescriptorHandleForHeapStart().ptr;
-        let sky_step = device.GetDescriptorHandleIncrementSize(kind);
-        (sky_root, sky_mean, sky_heap, sky_cpu, sky_gpu, sky_step)
-    };
+    let reflect = pipeline("REFLECT", s!("reflect_light"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
-        sky_root,
         keep,
         mean,
         place,
@@ -663,12 +558,6 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
-        sky_mean,
-        sky_heap,
-        sky_cpu,
-        sky_gpu,
-        sky_step,
-        sky_next: AtomicU32::new(0),
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -704,184 +593,147 @@ pub(crate) struct Views {
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
-    /// The title's currently bound descriptor heaps (restored after sky-dome sampling).
-    pub(crate) view_heap: ID3D12DescriptorHeap,
-    pub(crate) sampler_heap: Option<ID3D12DescriptorHeap>,
+    /// The size of the depth (the image's but for [`Role::Miss`]).
+    pub(crate) depth_size: [u32; 2],
 }
 
-/// Time-based EMA factor (`VICTORY_AMBIENT_SETTLE=<ms>`, default `250` ms;
-/// `0` falls back to fixed per-frame `fallback`) so lighting adapts cleanly
-/// across cutscene cuts and indoor transitions instead of staying dark for seconds.
-fn settle_alpha(last_ms: &std::sync::atomic::AtomicU64, fallback: f32) -> f32 {
-    static TAU_MS: OnceLock<f32> = OnceLock::new();
-    let tau = *TAU_MS.get_or_init(|| {
-        let raw = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_default();
-        let first = raw.split(',').next().unwrap_or("").trim();
-        if first.is_empty() {
-            250.0
-        } else {
-            first.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(250.0)
-        }
-    });
-    if tau <= 0.0 {
-        return fallback;
-    }
-    let now = crate::host::now_ms();
-    let prev = last_ms.swap(now, Ordering::Relaxed);
-    if prev == 0 {
-        return 1.0;
-    }
-    let dt = now.saturating_sub(prev).clamp(1, 2000) as f32;
-    (1.0 - (-dt / tau).exp()).clamp(fallback, 0.22)
+/// For the line every ten seconds: what the stand-in for reflections did.
+struct Said {
+    /// Dispatches of the miss program it followed, frames they were in,
+    /// and those it left as they were: of water, and before a frame's
+    /// light was kept (or no tables).
+    ran: AtomicU64,
+    frames: AtomicU64,
+    water: AtomicU64,
+    not_ready: AtomicU64,
+    last_frame: AtomicU64,
+    /// Bit 0 opaque surfaces, 1 alpha, 2 water, 3 others.
+    layers: AtomicU64,
 }
 
-/// Samples the title's sky dome (`ps_sky_paraboloid_reflection`) into
-/// `cells[3 * CELLS + 1]` and restores the list's descriptor heaps.
-fn update_sky(list: &HostList, pass: &Pass, views: &Views, g: &crate::graphics::Settings) {
-    let Some([gain, least, power]) = sky_follow(g) else {
+static SAID_MISS: Said = Said {
+    ran: AtomicU64::new(0),
+    frames: AtomicU64::new(0),
+    water: AtomicU64::new(0),
+    not_ready: AtomicU64::new(0),
+    last_frame: AtomicU64::new(u64::MAX),
+    layers: AtomicU64::new(0),
+};
+
+/// What came of a dispatch of the miss program, counted for the line.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MissNote {
+    Ran(u32),
+    Water,
+    NotReady,
+}
+
+/// Counts what came of a dispatch of the miss program; every ten seconds an
+/// info line says it, so a run shows that the stand-in ran and where.
+pub(crate) fn note_miss(note: MissNote) {
+    use AtomicOrdering::Relaxed;
+    if specular().is_none() {
         return;
-    };
-    let Some(sky_copy) = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
-        return;
-    };
-    let Some(host) = host() else {
-        return;
-    };
-    let read_state =
-        (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32;
-    list.keep(&sky_copy.texture);
-    list.settle(&sky_copy, read_state);
-    // SAFETY: live sky texture; ring slot in our own shader-visible heap; valid open command list.
-    unsafe {
-        let d = sky_copy.texture.GetDesc();
-        static LOGGED: std::sync::Once = std::sync::Once::new();
-        LOGGED.call_once(|| {
-            tracing::info!(
-                width = d.Width,
-                height = d.Height,
-                slices = d.DepthOrArraySize,
-                gain,
-                least,
-                power,
-                "ambient light follows the sky dome for time-of-day exposure"
-            );
-        });
-        let slot = pass.sky_next.fetch_add(1, Ordering::Relaxed) % SKY_SLOTS;
-        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-            ptr: pass.sky_cpu + (slot * pass.sky_step) as usize,
-        };
-        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: pass.sky_gpu + u64::from(slot * pass.sky_step),
-        };
-        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: d.Format,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: 1,
-                    FirstArraySlice: 0,
-                    ArraySize: u32::from(d.DepthOrArraySize).max(1),
-                    PlaneSlice: 0,
-                    ResourceMinLODClamp: 0.0,
-                },
-            },
-        };
-        host.device.CreateShaderResourceView(&sky_copy.texture, Some(&srv), cpu);
-        static LAST_SKY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sky_alpha = settle_alpha(&LAST_SKY_MS, 0.08);
-        let l = &list.list;
-        let sky_consts = [gain.to_bits(), least.to_bits(), power.to_bits(), sky_alpha.to_bits()];
-        l.SetDescriptorHeaps(&[Some(pass.sky_heap.clone())]);
-        l.SetComputeRootSignature(&pass.sky_root);
-        l.SetComputeRoot32BitConstants(0, 4, sky_consts.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, gpu);
-        l.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
-        l.SetPipelineState(&pass.sky_mean);
-        l.Dispatch(1, 1, 1);
-        uav_barrier(l);
-        // Restore the title's heaps before running the main resolve/reflect passes.
-        if let Some(sampler) = &views.sampler_heap {
-            l.SetDescriptorHeaps(&[Some(views.view_heap.clone()), Some(sampler.clone())]);
-        } else {
-            l.SetDescriptorHeaps(&[Some(views.view_heap.clone())]);
+    }
+    let s = &SAID_MISS;
+    match note {
+        MissNote::Ran(layer) => {
+            s.ran.fetch_add(1, Relaxed);
+            s.layers.fetch_or(1 << layer.min(3), Relaxed);
+            let frame = crate::frame::current();
+            if s.last_frame.swap(frame, Relaxed) != frame {
+                s.frames.fetch_add(1, Relaxed);
+            }
+        }
+        MissNote::Water => {
+            s.water.fetch_add(1, Relaxed);
+        }
+        MissNote::NotReady => {
+            s.not_ready.fetch_add(1, Relaxed);
         }
     }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let Some(since) = *last else {
+        *last = Some(now);
+        return;
+    };
+    if now.duration_since(since).as_secs_f32() < 10.0 {
+        return;
+    }
+    *last = Some(now);
+    let layers = s.layers.swap(0, Relaxed);
+    let named: Vec<&str> = [(1, "opaque"), (2, "alpha"), (4, "water"), (8, "other")]
+        .iter()
+        .filter(|(bit, _)| layers & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    let Specular { share, sky } = specular().unwrap_or(Specular { share: 0.0, sky: 0.0 });
+    tracing::info!(
+        "a stand-in for reflections (VICTORY_AMBIENT_SPECULAR={share},{sky}) in the last {:.0} s: \
+         {} frames, {} dispatches of CS_RayMiss followed (surfaces: {}), each by an estimate along \
+         the reflected direction put in right after it (before CS_ResolveScreenSpace); {} of water or the alpha layer \
+         and {} before a frame's light was kept left as the title had them",
+        now.duration_since(since).as_secs_f32(),
+        s.frames.swap(0, Relaxed),
+        s.ran.swap(0, Relaxed),
+        if named.is_empty() { "none".to_owned() } else { named.join(", ") },
+        s.water.swap(0, Relaxed),
+        s.not_ready.swap(0, Relaxed),
+    );
 }
 
 /// After the title's program of that role, in `list` with the program's view
 /// heap set. Replaces the list's compute root signature and pipeline; false
 /// if it recorded nothing.
 pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
+    use std::sync::atomic::Ordering;
     let Some(pass) = pass() else {
         return false;
     };
-    let g = crate::graphics::current();
-    if !g.ambient_enabled {
-        return false;
-    }
-    let (level, constant) = if g.ambient_constant > 0.0 {
-        (0.0f32, g.ambient_constant)
-    } else if g.ambient_level > 0.0 {
-        (g.ambient_level, 0.0f32)
-    } else {
-        return false;
+    // The share of the estimate, and the constant (for reflections: the
+    // share of the title's sky kept); the keep runs for either stand-in.
+    let (level, constant) = match (role, set(), specular()) {
+        (Role::Miss, _, Some(s)) => (s.share, s.sky),
+        (Role::Miss, _, None) => return false,
+        (Role::Radiance, Set::Off, Some(_)) => (0.0, 0.0),
+        (_, Set::Off, _) => return false,
+        (_, Set::Estimate(level), _) => (level, 0.0f32),
+        (_, Set::Constant(level), _) => (0.0, level),
     };
-    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+    let estimate = role == Role::Miss || constant == 0.0;
+    if role != Role::Radiance && estimate && !KEPT.load(Ordering::Relaxed) {
+        if role == Role::Miss {
+            note_miss(MissNote::NotReady);
+        }
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || g.air_cap <= 0.0 || g.gather_step == 0) {
-        return false;
-    }
-    let (reflect_cap, reflect_floor) = (g.reflect_cap, g.reflect_floor);
-    if role == Role::Reflect && reflect_cap <= 0.0 && reflect_floor <= 0.0 {
+    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 8 {
+        if *said < 5 {
             *said += 1;
-            tracing::info!(
-                ?role,
-                preset = g.preset.name(),
-                size = ?views.size,
-                level,
-                constant,
-                ao_taps = g.ao_taps,
-                contact_steps = g.contact_steps,
-                gather_step = g.gather_step,
-                "a stand-in for the indirect light"
-            );
+            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    if role == Role::Resolve && constant == 0.0 {
-        update_sky(list, pass, views, &g);
-    }
-    let floats = [level, constant, g.ao_strength, g.ao_radius, 0.1, 0.45];
-    let mut words = [0u32; 16];
+    let [strength, radius] = shade();
+    let floats = [level, constant, strength, radius, 0.1, 0.45];
+    let mut words = [0u32; 12];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
-    static LAST_RAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    words[6] = views.size[0];
-    words[7] = views.size[1];
-    words[8] = if role == Role::Radiance {
-        settle_alpha(&LAST_RAD_MS, 0.04)
-    } else {
-        0.04f32
-    }
-    .to_bits();
-    words[9] = g.ambient_most.to_bits();
-    words[10] = if role == Role::Reflect { reflect_cap } else { g.air_cap }.to_bits();
-    words[11] = if role == Role::Resolve { g.ambient_floor } else { reflect_floor }.to_bits();
-    words[12] = g.ao_taps;
-    words[13] = g.contact_steps;
-    words[14] = g.gather_step;
-    words[15] = g.ceiling_floor.to_bits();
+    words[6] = views.depth_size[0];
+    words[7] = views.depth_size[1];
+    words[8] = 0.04f32.to_bits();
+    words[9] = most_keep().to_bits();
+    words[10] = air().to_bits();
+    words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -889,7 +741,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -906,13 +758,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
-            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
-                if constant == 0.0 && g.gather_step > 0 {
+                if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
+            Role::Miss => {
+                // The points afresh, from this frame's depth: the diffuse
+                // stand-in makes them later in the frame.
+                run(&pass.place, 8, 9, 1);
+                run(&pass.gather, 20, 45, 1);
+                run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }
@@ -934,11 +792,71 @@ mod tests {
     }
 
     #[test]
+    fn specular_settings() {
+        assert_eq!(parse_specular(""), None);
+        assert_eq!(parse_specular("0"), None);
+        assert_eq!(parse_specular("off"), None);
+        assert_eq!(parse_specular("1"), Some(Specular { share: 1.0, sky: 0.0 }));
+        assert_eq!(parse_specular("0.6, 0.25"), Some(Specular { share: 0.6, sky: 0.25 }));
+        assert_eq!(parse_specular("0.6,7"), Some(Specular { share: 0.6, sky: 1.0 }));
+        assert_eq!(parse_specular("0.6,x"), Some(Specular { share: 0.6, sky: 0.0 }));
+    }
+
+    #[test]
     fn roles_by_name() {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+        assert_eq!(role(b"..CS_RayMiss_de6b91a6_Wrapped.."), Some(Role::Miss));
+        assert_eq!(role(b"..CS_RayMiss_Volumetrics_3c5d8c00_Wrapped.."), None);
+        assert_eq!(role(b"..CS_ScreenProbe_RayMiss_80a88544_Wrapped.."), None);
+    }
+
+    /// The keep and raise as they act on the light, frame after frame, for
+    /// surfaces that send out `a` of the light they get and the title's own
+    /// light `title` on each (`VICTORY_AMBIENT_ONCE`'s model): the light it
+    /// settles at on each surface.
+    fn settle(level: f32, a: f32, title: &[f32], once: bool) -> Vec<f32> {
+        let mut light = title.to_vec();
+        let mut share = vec![1.0f32; title.len()];
+        for _ in 0..500 {
+            // Keep: what the surfaces sent out (the frame before), counted by
+            // the share of the title's own light there with `once`.
+            let sent: f32 = light
+                .iter()
+                .zip(&share)
+                .map(|(l, s)| a * l * if once { *s } else { 1.0 })
+                .sum::<f32>()
+                / title.len() as f32;
+            // Raise: never below the title's own light.
+            for (i, t) in title.iter().enumerate() {
+                light[i] = t.max(level * sent);
+                share[i] = t / light[i].max(1e-6);
+            }
+        }
+        light
+    }
+
+    /// Without it the stand-in's own light comes back to it: a lit wall and a
+    /// dark one settle at `level a t / 2 / (1 - level a / 2)` on the dark one,
+    /// a third more than one bounce at walls that send out 0.6, three
+    /// quarters more at 0.9. With it, one bounce of the title's light.
+    #[test]
+    fn once_is_one_bounce_of_the_titles_light() {
+        for a in [0.6f32, 0.9] {
+            let one_bounce = 0.8 * a * 1.0 / 2.0;
+            let fed = settle(0.8, a, &[1.0, 0.0], false)[1];
+            let once = settle(0.8, a, &[1.0, 0.0], true)[1];
+            assert!(
+                (fed - one_bounce / (1.0 - 0.8 * a / 2.0)).abs() < 1e-4,
+                "a={a}: fed back {fed}"
+            );
+            assert!((once - one_bounce).abs() < 1e-4, "a={a}: once {once}");
+            assert!(fed > 1.3 * once);
+        }
+        // Where the title's light is above the estimate nothing changes.
+        assert_eq!(settle(0.8, 0.6, &[1.0, 1.0], true), vec![1.0, 1.0]);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
