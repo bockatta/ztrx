@@ -2243,6 +2243,10 @@ enum Step {
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
     Placed(place::Placed),
+    /// Work that reads the result of preceding `Step::Texture` detiling (e.g.
+    /// `tiles::Tiled::uploaded(staging.detiled)`): runs after `Batch::refresh_textures`
+    /// when `VICTORY_WIDE_TEXTURES=1` batches detiling without `refresh_front`.
+    AfterTextures(std::sync::Arc<dyn Fn() + Send + Sync>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -3054,7 +3058,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) | Step::AfterTextures(..) => {}
             }
         }
     }
@@ -7590,6 +7594,12 @@ impl HostList {
         deferred.copies.push(Step::Texture(staging));
     }
 
+    /// Runs `work` at submission time strictly after any queued `Step::Texture`
+    /// staging buffers in this submission have finished detiling (`refresh_textures`).
+    pub(crate) fn defer_after_textures(&self, work: impl Fn() + Send + Sync + 'static) {
+        self.deferred().copies.push(Step::AfterTextures(std::sync::Arc::new(work)));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -7717,6 +7727,14 @@ impl HostList {
                         if !wide_textures() {
                             batch.refresh_textures();
                         }
+                    }
+                    continue;
+                }
+                Step::AfterTextures(work) => {
+                    if batch.due.is_empty() {
+                        work();
+                    } else {
+                        batch.after_textures.push(work.clone());
                     }
                     continue;
                 }
@@ -7957,6 +7975,8 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// Closures waiting for `due` textures to finish detiling (`Step::AfterTextures`).
+    after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// What copies at their place in the submission's lists put into title
     /// memory ([`place`]): the host copy, the title address, the bytes.
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
@@ -8736,20 +8756,27 @@ impl Batch {
         SPLIT[7].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
     }
 
-    /// The textures due are brought up to date.
+    /// The textures due are brought up to date, followed by any
+    /// `Step::AfterTextures` closures (e.g. tiled levels-on-demand mappings
+    /// that read `staging.detiled`).
     fn refresh_textures(&mut self) {
-        if self.due.len() < 2 || !wide_textures() {
-            self.due.drain(..).for_each(|staging| staging.refresh());
-            return;
+        if !self.due.is_empty() {
+            if self.due.len() < 2 || !wide_textures() {
+                self.due.drain(..).for_each(|staging| staging.refresh());
+            } else {
+                let _textures = crate::timeline::span("textures brought up to date");
+                // The time counted is the time it took, not the threads' sum.
+                let started = std::time::Instant::now();
+                let before = PREPARING[2].load(Ordering::Relaxed);
+                let due = std::mem::take(&mut self.due);
+                crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
+                let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            }
         }
-        let _textures = crate::timeline::span("textures brought up to date");
-        // The time counted is the time it took, not the threads' sum.
-        let started = std::time::Instant::now();
-        let before = PREPARING[2].load(Ordering::Relaxed);
-        let due = std::mem::take(&mut self.due);
-        crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
-        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        for work in self.after_textures.drain(..) {
+            work();
+        }
     }
 
     fn flush(&mut self) {

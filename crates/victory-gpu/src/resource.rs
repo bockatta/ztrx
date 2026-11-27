@@ -1765,7 +1765,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 #[cfg(windows)]
 pub(crate) fn bake_room(memory: Option<[u64; 4]>) -> bool {
     if let Some([budget, used, ..]) = memory
-        && used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 86
+        && used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 97
     {
         return true;
     }
@@ -2748,11 +2748,12 @@ impl OnDemand {
     /// Held levels get tiles only while the card has room ([`room`]).
     /// Returns whether a level is still without its tiles: the caller
     /// records the upload again later.
-    pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
+    pub(crate) fn uploaded(&self, held: u32, memory: u64, force_room: bool) -> bool {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        let has_room = force_room || room(crate::host::host().and_then(|h| h.video_memory()));
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, has_room);
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }

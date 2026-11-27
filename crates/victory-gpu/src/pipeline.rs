@@ -72,6 +72,10 @@ pub(crate) struct Shader {
     /// to track time-of-day exposure for the indirect-light stand-in (Belobug e48eb83e).
     #[cfg(windows)]
     pub(crate) draws_sky: bool,
+    /// True for any `PS_BakeDecorations*` character skin/tattoo/decoration bake shader
+    /// (354 variants in the title — catching all of them prevents stale/rainbow arm bakes).
+    #[cfg(windows)]
+    pub(crate) is_bake: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -134,6 +138,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                     && bytes
                         .windows(crate::ambient::SKY.len())
                         .any(|w| w == crate::ambient::SKY),
+                #[cfg(windows)]
+                is_bake: stage == "pixel"
+                    && bytes
+                        .windows(b"PS_BakeDecorations".len())
+                        .any(|w| w == b"PS_BakeDecorations"),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

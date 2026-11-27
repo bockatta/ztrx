@@ -931,12 +931,13 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
         // Then what the list's copy puts in the host copy is known.
-        list.defer_host(move || noted.note_held());
+        list.defer_after_textures(move || noted.note_held());
         return;
     };
+    let baking = BAKING.get();
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
-        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
+    list.defer_after_textures(move || {
+        let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64, baking);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
@@ -1276,10 +1277,11 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let _mapped = if no_wait() && !BAKING.get() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
+            // all (`no_wait`). Skin-bake passes (`BAKING`) always wait so
+            // character arms/faces never bake mid-remap garbage.
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
                 return self.refresh_unlocked(last, size);
             };

@@ -97,7 +97,7 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
-    } else if has(b"CS_UpdateHistory") {
+    } else if has(b"UpdateHistory") {
         Some(Role::Reflect)
     } else {
         None
@@ -364,10 +364,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float ao_tight = saturate(1.0 - strength * 1.75 * sum_tight);
         float ao_wide  = nw > 0 ? saturate(1.0 - strength * 1.65 * sum_wide) : ao_tight;
         float dist_fade = saturate(1.0 - (c.z - 220.0) / 130.0);
-        // Protect characters, interiors, and downward-facing ceilings from dark AO crush.
-        float ao_floor = n.y < -0.55 ? 0.54 : 0.32;
+        // Deep physical multi-bounce AO (0.11) for grounded under-bunk, table, arm,
+        // chin/collar, and architectural corner shadows; downward-facing ceilings stay
+        // softly shaded (0.44) so they never crush to pitch black.
+        float ao_floor = n.y < -0.55 ? 0.44 : 0.11;
         float raw_ao = saturate(ao_tight * 0.55 + ao_wide * 0.45);
-        float ao_shaped = pow(raw_ao, 1.02);
+        float ao_shaped = pow(raw_ao, 1.18);
         open = lerp(1.0, lerp(ao_floor, 1.0, ao_shaped), dist_fade);
         bent_n = normalize(n + bent * (0.045 * dist_fade));
     }
@@ -405,11 +407,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
         }
         all = float3(sr.w, sg.w, sb.w) / sum;
         // Directional SH1 bounce evaluated along bent normal for grounded colored bounce.
-        dir_sh = all + 1.55 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
-        dir_sh = clamp(dir_sh, 0.18 * all, 2.8 * all);
+        dir_sh = all + 1.65 * float3(dot(sr.xyz, bent_n), dot(sg.xyz, bent_n), dot(sb.xyz, bent_n)) / sum;
+        dir_sh = clamp(dir_sh, 0.12 * all, 2.9 * all);
         sh_vec = (sr.xyz * LUMA.r + sg.xyz * LUMA.g + sb.xyz * LUMA.b) / sum;
     }
-    float3 bounce = lerp(dir_sh, cells[CELLS].rgb, 0.12) * level;
+    float3 bounce = lerp(dir_sh, cells[CELLS].rgb, 0.07) * level;
     // Screen-space directional contact shadows (configurable steps; disabled on
     // downward-facing ceilings n.y <= -0.55 so ceilings never self-shadow black).
     float dir_shadow = 1.0;
@@ -439,26 +441,27 @@ void raise(uint3 at : SV_DispatchThreadID) {
             }
         }
         float s_fade = saturate(1.0 - (c.z - 60.0) / 60.0);
-        dir_shadow = lerp(1.0, lerp(1.0, 0.56, occ_max * saturate(strength * 0.75)), s_fade);
+        dir_shadow = lerp(1.0, lerp(1.0, 0.30, occ_max * saturate(strength * 0.80)), s_fade);
     }
     float4 sky_entry = cells[3 * CELLS + 1];
-    float hemi_floor = clamp(ceiling_floor, 0.42, 0.85);
+    float hemi_floor = clamp(ceiling_floor, 0.36, 0.85);
     if (sky_entry.a > 0.0) {
-        // Calibrated sky-dome indirect floor with lifted ceiling hemisphere so
-        // indoor rooms & cutscenes stay bright while sun shadows stay crisp outdoors.
+        // Calibrated sky-dome indirect floor modulated by directional SH1 ratio,
+        // hemisphere normal orientation, and distance fade so GTA VI's real sun
+        // and interior shadows hold deep cinematic contrast.
         float all_luma = max(dot(all, LUMA), 1e-4);
-        float3 dir_ratio = clamp(dir_sh / all_luma, 0.52, 1.85);
-        float3 room_avg = max(cells[CELLS].rgb, float3(0.012, 0.0118, 0.0112));
-        float room_luma = max(dot(room_avg, LUMA), 0.012);
-        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.60, 1.50), 0.40);
+        float3 dir_ratio = clamp(dir_sh / all_luma, 0.42, 1.90);
+        float3 room_avg = max(cells[CELLS].rgb, float3(0.006, 0.0059, 0.0056));
+        float room_luma = max(dot(room_avg, LUMA), 0.006);
+        float3 room_tint = lerp(float3(1.0, 1.0, 1.0), clamp(room_avg / room_luma, 0.55, 1.55), 0.45);
         float hemi = lerp(hemi_floor, 1.0, saturate(bent_n.y * 0.5 + 0.5));
-        float indoor_fill = lerp(1.0, 0.62, saturate((c.z - 12.0) / 18.0));
-        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.55)
-            * hemi * indoor_fill * max(level, 0.85);
+        float indoor_fill = lerp(1.0, 0.48, saturate((c.z - 12.0) / 18.0));
+        float3 sky_fill = sky_entry.rgb * room_tint * lerp(float3(1.0, 1.0, 1.0), dir_ratio, 0.65)
+            * hemi * indoor_fill * max(level, 0.72);
         bounce = max(bounce, sky_fill);
     } else if (reflect_floor > 0.0) {
-        float3 room_avg = max(cells[CELLS].rgb, float3(0.012, 0.0118, 0.0112));
-        float room_luma = max(dot(room_avg, LUMA), 0.012);
+        float3 room_avg = max(cells[CELLS].rgb, float3(0.008, 0.0078, 0.0075));
+        float room_luma = max(dot(room_avg, LUMA), 0.008);
         float3 room_tint = lerp(float3(1.0, 0.98, 0.94), clamp(room_avg / room_luma, 0.4, 1.8), 0.55);
         float hemi = lerp(hemi_floor, 1.0, saturate(bent_n.y * 0.5 + 0.5));
         bounce = max(bounce, room_tint * reflect_floor * hemi);
@@ -534,19 +537,32 @@ void clamp_reflect(uint3 at : SV_DispatchThreadID) {
     float3 c = unpack_r(reflected[p]);
     float4 sky_entry = cells[3 * CELLS + 1];
     float3 rad_base = cells[CELLS].rgb * level;
+    // Scale reflection ceiling to the ACTUAL room radiance (`rad_base`) rather
+    // than `max(rad_base, sky_entry)` — indoors `sky_entry` is the bright outdoor
+    // sky (10-15x brighter than a dim dorm room), which let unoccluded RT sky
+    // misses pass through as sharp white chrome/oily blobs on skin and tables!
     float3 base = constant > 0.0
         ? float3(1.0, 0.98, 0.94) * constant
-        : (sky_entry.a > 0.0 ? max(rad_base, sky_entry.rgb * level) : rad_base);
-    float base_luma = max(dot(base, LUMA), 0.02);
+        : (sky_entry.a > 0.0
+            ? min(max(rad_base, sky_entry.rgb * 0.18 * level), rad_base * 1.4 + 0.008)
+            : rad_base);
+    float base_luma = max(dot(base, LUMA), 1e-4);
     float has = dot(c, LUMA);
     if (air > 0.0) {
-        // Tight soft-knee shoulder: keeps genuine mirrors/SSR crisp up to `knee`
-        // while suppressing over-glossy unoccluded sky glare on skin, cloth, cars, and floors.
+        // Real SSR stays near local room luminance; unoccluded RT sky-misses jump
+        // sharply above `base_luma` right at the roughness threshold, painting flat
+        // white oily/chrome patches across skin and painted tables indoors.
+        // Compress strictly proportionally to `base_luma` (zero fixed 0.02 floor!)
+        // and roll strong sky-miss spikes back to subtle warm room reflection.
         float knee = air * base_luma;
         if (has > knee) {
+            float ratio = has / base_luma;
+            float sky_miss = saturate((ratio - 1.35) / 2.0);
             float excess = has - knee;
-            float compressed = knee + excess / (1.0 + excess / max(knee * 0.22, 0.02));
-            c *= compressed / max(has, 1e-6);
+            float soft = knee + excess / (1.0 + excess / max(knee * 0.12, 1e-5));
+            float3 clamped = c * (soft / max(has, 1e-6));
+            float3 room_refl = base * (air * 0.45);
+            c = lerp(clamped, min(clamped, room_refl), sky_miss * 0.90);
         }
     }
     if (reflect_floor > 0.0) {
@@ -825,7 +841,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     static SAID: Mutex<u32> = Mutex::new(0);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
+        if *said < 8 {
             *said += 1;
             tracing::info!(
                 ?role,
