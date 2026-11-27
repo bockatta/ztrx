@@ -2318,32 +2318,22 @@ impl State {
         };
         let waiting = !sources.queued.is_empty() || !sources.unmade.is_empty();
         let mut done = [0u64; 4];
-        let mut skipped = false;
+        let skipped = false;
         if mode == BakeMode::Upload && waiting {
             // Explicit skin-bake source textures (`PS_BakeDecorations*`) are
             // ~1-10 MB total across a draw (capped by VICTORY_BAKE_SOURCES_MB=64)
-            // and run once per character; refusing them permanently bakes rainbow
-            // BC7 garbage into faces/arms for the rest of the run. Allow unless
-            // DXGI real usage is literally at 100% of budget.
-            let mem = crate::host::host().and_then(|h| h.video_memory());
-            let allow_bake_src = crate::resource::bake_room(mem)
-                || mem.is_none_or(|[budget, used, ..]| {
-                    budget == 0 || used.saturating_sub(crate::pool::texture_room()) < budget
-                });
-            if allow_bake_src {
-                host.texture_slots_requeue(&sources.unmade, crate::frame::current());
-                PASS_SOURCES.set(Some(sources.queued.iter().chain(&sources.unmade).copied().collect()));
-                PASS_SOURCED.set([0; 4]);
-                PASS_BUDGET.set(Some((0, 0, true)));
-                crate::texture::BAKING.set(bake_exact());
-                self.heap_textures(list, heap, host);
-                crate::texture::BAKING.set(false);
-                PASS_BUDGET.set(None);
-                PASS_SOURCES.set(None);
-                done = PASS_SOURCED.get();
-            } else {
-                skipped = true;
-            }
+            // and run once per character; skipping them permanently bakes black
+            // or rainbow BC7 garbage into faces/arms for the rest of the scene.
+            host.texture_slots_requeue(&sources.unmade, crate::frame::current());
+            PASS_SOURCES.set(Some(sources.queued.iter().chain(&sources.unmade).copied().collect()));
+            PASS_SOURCED.set([0; 4]);
+            PASS_BUDGET.set(Some((0, 0, true)));
+            crate::texture::BAKING.set(bake_exact());
+            self.heap_textures(list, heap, host);
+            crate::texture::BAKING.set(false);
+            PASS_BUDGET.set(None);
+            PASS_SOURCES.set(None);
+            done = PASS_SOURCED.get();
         }
         Self::log_bake_sources(p, &sources, done, Self::bake_missing(&sources, host), skipped);
     }

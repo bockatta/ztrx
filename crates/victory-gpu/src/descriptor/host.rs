@@ -273,6 +273,25 @@ pub(crate) fn levels_changed_after(start: u64) {
 
 static RESHOWN_AFTER: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// Drains all placed texture starts whose tiled `first_shown` level changed
+/// (including any [`RESHOWN_AFTER`] entries whose submission has finished).
+pub(crate) fn take_reshown() -> Vec<u64> {
+    {
+        let mut after = RESHOWN_AFTER.lock().unwrap_or_else(|e| e.into_inner());
+        if !after.is_empty() {
+            let finished = crate::host::submissions().1;
+            let mut now = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
+            after.retain(|&(at, start)| {
+                if at <= finished {
+                    now.push(start);
+                }
+                at > finished
+            });
+        }
+    }
+    std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Slots that show a placed texture from another level than the title's view
 /// in them says now, and are made from that view when the upload it needs
 /// has run ([`HostHeap::texture_slot_flip`]).
@@ -969,40 +988,99 @@ impl TextureQueue {
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        // Already-uploaded slots awaiting periodic fingerprint rechecks stay
+        // behind unuploaded `fresh` and streaming `again` slots so periodic
+        // rechecks never starve brand-new character faces/skin during a scene
+        // cut.
+        let mut recheck: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.checked.2 != 0 {
+                &mut recheck
+            } else if w.looks > 0 || w.mapped > 0 {
+                &mut again
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
-        let (mut new, mut old) = (0, fresh.len());
+        recheck.sort_unstable_by(newest_first);
+        let fresh_total = fresh.len();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh_total.min(max));
+        let (mut new, mut old) = (0, fresh_total);
+        // Under a large cutscene/chapter backlog (>512 fresh slots), pull 3
+        // newest writes for every 1 oldest so newly streamed character faces
+        // load immediately instead of waiting behind old chapters.
+        let new_burst = if fresh_total > 512 { 3 } else { 1 };
         while new < old && fresh_order.len() < max {
-            fresh_order.push((fresh[new].1, fresh[new].2));
-            new += 1;
+            for _ in 0..new_burst {
+                if new >= old || fresh_order.len() >= max {
+                    break;
+                }
+                fresh_order.push((fresh[new].1, fresh[new].2));
+                new += 1;
+            }
             if new < old && fresh_order.len() < max {
                 old -= 1;
                 fresh_order.push((fresh[old].1, fresh[old].2));
             }
         }
         let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        let recheck_order = recheck.iter().map(|&(_, index, write)| (index, write));
         if !fair_due() {
             let mut order: Vec<(u32, u64)> = again_order.collect();
             order.extend(fresh_order);
+            order.extend(recheck_order);
             order.truncate(max);
             return order;
         }
         let mut fresh_order = fresh_order.into_iter();
-        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        let mut order = Vec::with_capacity(max.min(fresh_total + again.len() + recheck.len()));
+        // When hundreds of brand-new unuploaded textures are queued (cutscene
+        // cut or new area), prioritize 3 fresh slots per 1 previously-looked-at
+        // slot so unmapped/partly-mapped retries don't stall character faces.
+        let fresh_burst = if fresh_total > 256 { 3 } else { 1 };
         while order.len() < max {
-            let (a, b) = (again_order.next(), fresh_order.next());
-            if a.is_none() && b.is_none() {
+            let mut progressed = false;
+            if fresh_burst == 1 {
+                if let Some(a) = again_order.next() {
+                    order.push(a);
+                    progressed = true;
+                }
+                if order.len() < max
+                    && let Some(b) = fresh_order.next()
+                {
+                    order.push(b);
+                    progressed = true;
+                }
+            } else {
+                for _ in 0..fresh_burst {
+                    if order.len() >= max {
+                        break;
+                    }
+                    if let Some(b) = fresh_order.next() {
+                        order.push(b);
+                        progressed = true;
+                    } else {
+                        break;
+                    }
+                }
+                if order.len() < max
+                    && let Some(a) = again_order.next()
+                {
+                    order.push(a);
+                    progressed = true;
+                }
+            }
+            if !progressed {
                 break;
             }
-            order.extend(a);
-            order.extend(b);
+        }
+        if order.len() < max {
+            order.extend(recheck_order.take(max - order.len()));
         }
         order.truncate(max);
         order
@@ -2175,27 +2253,24 @@ impl HostHeap {
         if self.sampler {
             return 0;
         }
-        {
-            let mut after = RESHOWN_AFTER.lock().unwrap_or_else(|e| e.into_inner());
-            if !after.is_empty() {
-                let finished = crate::host::submissions().1;
-                let mut now = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
-                after.retain(|&(at, start)| {
-                    if at <= finished {
-                        now.push(start);
-                    }
-                    at > finished
-                });
-            }
-        }
-        let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
-        if starts.is_empty() {
+        let starts = take_reshown();
+        self.texture_views_remade_for(&starts)
+    }
+
+    /// Remakes the host slots of every placed texture whose memory starts at
+    /// one of `starts` (drained via [`take_reshown`]) so views reflect the
+    /// latest `first_shown` tiled level before the submission that reads them
+    /// executes.
+    pub(crate) fn texture_views_remade_for(&self, starts: &[u64]) -> usize {
+        if self.sampler || starts.is_empty() {
             return 0;
         }
-        let slots: Vec<u32> = {
+        let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
+        slots.sort_unstable();
+        slots.dedup();
         let mut remade = 0;
         for slot in slots {
             let _made = self.made.lock(slot);
@@ -5756,6 +5831,38 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Already-uploaded fingerprint-recheck slots stay behind unuploaded
+    /// `fresh` and streaming `again` slots, and large scene-transition
+    /// backlogs (>512 fresh) prioritize newest writes 3:1 over oldest and
+    /// retry slots so newly streamed character faces never sit black.
+    #[test]
+    fn recheck_slots_never_starve_fresh_textures() {
+        let mut q = TextureQueue::default();
+        // 10 already-uploaded slots due for fingerprint recheck.
+        for i in 0..10u32 {
+            q.written(i, 1, 0, false);
+            let w = q.due(1, 100).iter().find(|d| d.0 == i).unwrap().1;
+            q.recheck(i, w, 10, (0x1000 * u64::from(i + 1), 4096), 0x1234, 0, 1);
+        }
+        // 600 brand-new unuploaded slots (simulating a cutscene transition) + 10 retry slots.
+        for i in 100..110u32 {
+            q.written(i, 5, 0, false);
+            let w = q.due(5, 100).iter().find(|d| d.0 == i).unwrap().1;
+            q.later(i, w, 5, 4);
+        }
+        for i in 1000..1600u32 {
+            q.written(i, 10, 0, false);
+        }
+        let top20: Vec<u32> = q.due(10, 20).into_iter().map(|d| d.0).collect();
+        // Zero recheck slots in the top 20; first 3 are newest fresh (1599, 1598, 1597).
+        assert!(top20.iter().all(|&s| s >= 100), "recheck slots must wait behind fresh/again: {top20:?}");
+        assert_eq!(&top20[..3], &[1599, 1598, 1597]);
+        // Recheck slots still appear after fresh and again are drained.
+        let all: Vec<u32> = q.due(10, 1000).into_iter().map(|d| d.0).collect();
+        assert_eq!(all.len(), 620);
+        assert!(all[610..].iter().all(|&s| s < 10), "recheck slots come last: {:?}", &all[610..]);
     }
 
     /// Slots looked at before and slots never looked at are served in

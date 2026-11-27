@@ -1576,6 +1576,50 @@ pub(crate) fn make_waiting() {
     }
 }
 
+/// Remakes shader-visible texture descriptors for any tiled textures whose
+/// `first_shown` level changed during this submission's `Step::AfterTextures`
+/// (`on_demand.uploaded` / `card_wrote`), right before `ExecuteCommandLists`.
+/// Without this, a one-time `PS_BakeDecorations*` skin-bake draw on the same
+/// submission samples unmapped mip 0 (Tier 2 zeros) and permanently bakes
+/// pitch-black `#000000` faces/arms onto characters.
+#[cfg(windows)]
+pub(crate) fn remake_views_now() -> usize {
+    let starts = host::take_reshown();
+    if starts.is_empty() {
+        return 0;
+    }
+    let mut remade = 0usize;
+    {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps are live while `SHADER_HEAPS` is locked.
+            let heap = unsafe { &*(at as *const Heap) };
+            if !heap.samplers()
+                && let Some(Some(host)) = heap.host.get()
+            {
+                remade += host.texture_views_remade_for(&starts);
+            }
+        }
+    }
+    if remade > 0 {
+        if let Some(h) = crate::host::host() {
+            let _ = crate::host::flush_mapped(&h.device);
+        }
+        static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let prev = TOTAL.fetch_add(remade as u64, std::sync::atomic::Ordering::Relaxed);
+        let now = prev + remade as u64;
+        if prev == 0 || now / 500 > prev / 500 {
+            tracing::info!(
+                remade,
+                total = now,
+                textures = starts.len(),
+                "remade tiled texture views before submission execute"
+            );
+        }
+    }
+    remade
+}
+
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;

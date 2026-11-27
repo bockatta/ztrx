@@ -5964,6 +5964,11 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        // Remakes any tiled-texture slots whose `first_shown` changed during
+        // `batch.flush()` (`Step::AfterTextures` -> `on_demand.uploaded`) so
+        // draws in this submission (especially one-shot `PS_BakeDecorations*`)
+        // never sample unmapped mip 0 (Tier 2 black zeros).
+        crate::descriptor::remake_views_now();
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
