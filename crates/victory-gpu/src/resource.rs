@@ -2240,9 +2240,15 @@ pub(crate) static EVICTED_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomi
 fn evict_slot_held(all: &std::collections::BTreeSet<usize>, idle_ms: u64, idle_frames: u64) -> (std::collections::HashSet<usize>, Vec<(usize, u64)>) {
     use std::sync::atomic::Ordering::Relaxed;
     const MOST: u64 = 512 << 20;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static EVICT_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static EVICT_UNMAPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let evict_all = *EVICT_ALL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_EVICT").is_some_and(|v| v == "1"));
+    // Safe default: under VRAM pressure across chapter transitions (e.g. Cafe/Prison
+    // -> Boat/Florida Keys), reclaim ONLY placed textures whose title memory GTA VI
+    // itself has already completely unmapped (`mapped_bytes == 0`), never live textures.
+    let evict_unmapped = *EVICT_UNMAPPED.get_or_init(|| std::env::var_os("VICTORY_EVICT_UNMAPPED").is_none_or(|v| v != "0"));
     let none = (std::collections::HashSet::new(), Vec::new());
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_EVICT").is_some_and(|v| v == "1")) {
+    if !evict_all && !evict_unmapped {
         return none;
     }
     let video = crate::host::host().and_then(|h| h.video_memory());
@@ -2262,6 +2268,19 @@ fn evict_slot_held(all: &std::collections::BTreeSet<usize>, idle_ms: u64, idle_f
         if !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
         }
+        if !evict_all {
+            if !r.host.placed.load(Relaxed) {
+                continue;
+            }
+            let ptr = r.data().cast_const();
+            if ptr.is_null() || crate::texture::committed(ptr, 1) {
+                continue;
+            }
+            let len = texture_layout(&r.desc).map_or(4096, |t| t.size as usize).max(1);
+            if crate::texture::mapped_bytes(ptr, len) > 0 {
+                continue;
+            }
+        }
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((host, _)) = made.as_ref()
             && crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, idle_frames)
@@ -2274,6 +2293,15 @@ fn evict_slot_held(all: &std::collections::BTreeSet<usize>, idle_ms: u64, idle_f
     }
     let waits = crate::descriptor::release_slots_of(&by_texture);
     let held: std::collections::HashSet<usize> = waits.iter().map(|&(resource, _)| resource).collect();
+    if !waits.is_empty() {
+        tracing::info!(
+            textures = held.len(),
+            slots = waits.len(),
+            mb = bytes >> 20,
+            unmapped_only = !evict_all,
+            "evicted idle slot-held textures under VRAM pressure"
+        );
+    }
     (held, waits)
 }
 

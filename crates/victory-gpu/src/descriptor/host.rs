@@ -2833,6 +2833,8 @@ impl HostHeap {
                 continue;
             }
             let index = index as u32;
+            self.quick_is(index, 0);
+            self.made.set(index, 0);
             null_view(self.at(index));
             self.put(index);
             self.clear_twin(index);

@@ -122,6 +122,10 @@ impl Target {
     }
 
     pub(crate) fn owner(&self) -> usize { self.ticket.owner }
+
+    /// Whether the ticket is still valid (not invalidated by memory reuse or
+    /// remap; PR #1376). A stale target must be re-registered on next write.
+    pub(crate) fn fresh(&self) -> bool { self.ticket.valid.load(Ordering::Acquire) }
 }
 
 /// The readback resources and the allocation the pixels belong to.
