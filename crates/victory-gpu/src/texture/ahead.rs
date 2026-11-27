@@ -31,10 +31,20 @@ const DONE: u8 = 2;
 pub(crate) const LISTED: u8 = 3;
 
 /// Bytes of title memory on their way at most: past it uploads go into the
-/// lists, as before.
-const MOST: u64 = 96 << 20;
+/// lists, as before (`VICTORY_UPLOAD_AHEAD_MB`, default 256).
+fn most_bytes() -> u64 {
+    static MOST_BYTES: OnceLock<u64> = OnceLock::new();
+    *MOST_BYTES.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_AHEAD_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(256)
+            << 20
+    })
+}
 /// Bytes and textures of one submission at most.
-const BATCH: (u64, usize) = (16 << 20, 64);
+const BATCH: (u64, usize) = (32 << 20, 128);
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
@@ -103,7 +113,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    if BYTES.load(Relaxed) >= MOST
+    if BYTES.load(Relaxed) >= most_bytes()
         || copy.flags() & 0x7 != 0
         || copy.state.load(Relaxed) != 0
         || copy.grown.load(Relaxed)
@@ -156,6 +166,16 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
 }
 
+/// Waits for any in-flight ahead upload of `resource` to finish so a synchronous
+/// consumer (such as a `PS_BakeDecorations*` skin-bake draw) never races it.
+pub(crate) fn wait_resource(resource: This) {
+    if let Some(copy) = crate::resource::made_copy(resource)
+        && copy.ahead.load(Relaxed) == PENDING
+    {
+        listed(&copy);
+    }
+}
+
 /// The copy queue and its threads, made on first use.
 fn workers() -> Option<&'static ID3D12CommandQueue> {
     /// Free-threaded.
@@ -177,7 +197,12 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            let count = std::env::var("VICTORY_UPLOAD_AHEAD_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(4)
+                .clamp(1, 8);
+            for n in 0..count {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
@@ -237,6 +262,11 @@ impl Worker {
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
         for job in jobs {
             job.staging.refresh();
+        }
+        // Ensure newly committed host textures (`VICTORY_TEXTURE_POOL=0`) have
+        // completed `EnqueueMakeResident` before the copy queue writes into them.
+        if let Some(host) = crate::host::host() {
+            let _ = crate::host::flush_mapped(&host.device);
         }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.

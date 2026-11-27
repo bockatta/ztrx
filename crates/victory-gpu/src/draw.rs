@@ -2391,7 +2391,32 @@ impl State {
                 continue;
             }
             if host.texture_slot_made_from(index, handle) {
-                sources.ready += 1;
+                // Even if this source slot was uploaded earlier, GTA VI may have
+                // overwritten its aliased physical pages via DirectStorage before
+                // RECHECK_FRAMES fired. Run an exact full-texture check (and wait
+                // on any in-flight async upload) so PS_BakeDecorations* never
+                // permanently bakes stale/rainbow BC7 blocks onto faces or arms.
+                let stale_ready = crate::descriptor::view(handle).is_some_and(|view| {
+                    if let View::Placed(false, ref rdesc, ref desc) = view
+                        && crate::texture::mapped_bytes(
+                            (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
+                            crate::resource::placed_bytes(rdesc).unwrap_or(1) as usize,
+                        ) > 0
+                        && let Some(View::Shader(res, _)) = crate::descriptor::host::placed_texture(&view)
+                    {
+                        let res = res as This;
+                        crate::texture::ahead::wait_resource(res);
+                        let first = crate::resource::first_mip(desc);
+                        !crate::texture::is_staged(res) && !crate::texture::unchanged(res, first)
+                    } else {
+                        false
+                    }
+                });
+                if stale_ready {
+                    sources.unmade.push(index);
+                } else {
+                    sources.ready += 1;
+                }
             } else if let Some(View::Placed(false, resource, desc)) = crate::descriptor::view(handle)
                 && crate::texture::mapped_bytes(
                     (u64::from(desc[10]) | u64::from(desc[11]) << 32) as *const u8,
@@ -2657,6 +2682,14 @@ impl State {
             if room {
                 host.texture_slots_waiting(frame);
             }
+        } else {
+            // Explicit skin-bake sources pass: ensure any pending remaps,
+            // residency maps, tiled view updates, and show_after/ahead flips are
+            // live in the host descriptor heap before PS_BakeDecorations* draws.
+            host.texture_slots_remapped(frame, true);
+            let _ = crate::host::flush_mapped(&host_dev.device);
+            host.texture_views_remade();
+            host.texture_slots_flip();
         }
         let baking = crate::texture::BAKING.get();
         let (due, on_time) = match &sources {
@@ -2666,7 +2699,7 @@ impl State {
                 (d, n)
             }
             None => {
-                let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+                let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 8192 });
                 // (Those that are due later after all that are due.)
                 let on_time = due.len();
                 if baking {
@@ -2703,7 +2736,7 @@ impl State {
         let relook = *RELOOK_MS.get_or_init(|| {
             std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20_000)
         });
-        let most = (relook / took).clamp(16, 1024);
+        let most = (relook / took).clamp(8, 256);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2776,7 +2809,10 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            // For explicit skin-bake sources (`only == true`), bypass the partial
+            // 48 KiB fingerprint shortcut so mid-texture alias updates are always
+            // checked byte-for-byte via `unchanged(resource, first)` below.
+            if !only && let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
@@ -2951,6 +2987,9 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             // The host copy holds these very bytes: nothing to upload.
+            if baking {
+                crate::texture::ahead::wait_resource(resource);
+            }
             let first = match (&placed, &view) {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
@@ -3079,7 +3118,12 @@ impl State {
                 None
             };
             crate::texture::unstage(resource);
-            SPENT.fetch_add(bytes, Ordering::Relaxed);
+            // Uploads handed off to the async `ahead` copy queue do zero main-thread
+            // detiling/copying; charge only 1/4 toward the synchronous byte budget
+            // (the `ahead` queue enforces its own 256 MiB in-flight cap and the frame
+            // time span still bounds main-thread queuing).
+            let charge = if ahead.is_some() { (bytes / 4).max(4096) } else { bytes };
+            SPENT.fetch_add(charge, Ordering::Relaxed);
             since_asked += bytes;
             if !only && room && since_asked >= 32 << 20 {
                 since_asked = 0;

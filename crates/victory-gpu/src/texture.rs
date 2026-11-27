@@ -454,7 +454,9 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
-            read.resize(size, 0);
+            // Drop old buffer first so growing does not memcpy discarded bytes.
+            *read = Vec::new();
+            *read = vec![0; size];
         }
         f(&mut read[..size])
     })

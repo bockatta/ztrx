@@ -440,6 +440,12 @@ pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
     RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
 }
 
+/// Records `texture` as newly made so `VICTORY_UPLOAD_AHEAD` / `VICTORY_SHOW_AFTER`
+/// work for committed textures when `VICTORY_TEXTURE_POOL=0` too.
+pub(crate) fn note_fresh(texture: &ID3D12Resource) {
+    made_now(texture);
+}
+
 fn made_now(texture: &ID3D12Resource) {
     let now = now();
     let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());

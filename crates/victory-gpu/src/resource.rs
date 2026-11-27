@@ -2727,6 +2727,14 @@ fn host_texture_as(
         }
     }
     let texture = texture.ok_or(NoTexture::Refused)?;
+    if !reserved
+        && fills(desc)
+        && d.sample_count <= 1
+        && clear_value.is_none()
+        && crate::host::legal_for(d.flags, crate::host::texture_state(state)) == 0
+    {
+        crate::pool::note_fresh(&texture);
+    }
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });
