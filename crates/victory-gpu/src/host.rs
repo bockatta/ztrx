@@ -2343,9 +2343,6 @@ enum Step {
     /// Work that writes host memory only, and the title memory it reads
     /// (from, to; empty for none).
     Host(Box<dyn Fn() + Send>, (usize, usize)),
-    /// Host-only work that must run strictly after `Batch::refresh_textures()`
-    /// finishes detiling (e.g. `OnDemand::uploaded` reading `staging.detiled`).
-    AfterTextures(std::sync::Arc<dyn Fn() + Send + Sync>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -3137,7 +3134,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) | Step::AfterTextures(..) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
@@ -3841,6 +3838,8 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+mod font;
+mod menu;
 mod panel;
 mod place;
 mod send;
@@ -5883,10 +5882,6 @@ impl Host {
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
-        // Remake SRVs for any tiled `VICTORY_LEVELS_ON_DEMAND=1` textures whose
-        // first mapped level just changed during submission prep so Frame-1
-        // character faces/limbs never sample unmapped mip 0 (#000000 black).
-        let _ = crate::descriptor::remake_views_now();
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
@@ -7651,13 +7646,6 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
     }
 
-    /// Host-only work that must run strictly after `Batch::refresh_textures()`
-    /// finishes detiling (keeps `wide_textures()` parallel while guaranteeing
-    /// `staging.detiled` is populated before `OnDemand::uploaded`).
-    pub(crate) fn defer_after_textures(&self, work: impl Fn() + Send + Sync + 'static) {
-        self.deferred().copies.push(Step::AfterTextures(std::sync::Arc::new(work)));
-    }
-
     /// As [`HostList::defer_host`], for work that reads `len` bytes of title
     /// memory at `from`.
     pub(crate) fn defer_host_read(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {
@@ -7842,14 +7830,6 @@ impl HostList {
                         if !wide_textures() {
                             batch.refresh_textures();
                         }
-                    }
-                    continue;
-                }
-                Step::AfterTextures(work) => {
-                    if batch.due.is_empty() {
-                        work();
-                    } else {
-                        batch.after_textures.push(work.clone());
                     }
                     continue;
                 }
@@ -8170,7 +8150,6 @@ struct Batch {
     /// [`Batch::refresh_front`]'s walk over the steps.
     ranges: Vec<(usize, usize)>,
     touches: Vec<Touch>,
-    after_textures: Vec<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 thread_local! {
@@ -8693,19 +8672,16 @@ impl Batch {
     fn refresh_textures(&mut self) {
         if self.due.len() < 2 || !wide_textures() {
             self.due.drain(..).for_each(|staging| staging.refresh());
-        } else {
-            let _textures = crate::timeline::span("textures brought up to date");
-            // The time counted is the time it took, not the threads' sum.
-            let started = std::time::Instant::now();
-            let before = PREPARING[2].load(Ordering::Relaxed);
-            let due = std::mem::take(&mut self.due);
-            crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
-            let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            return;
         }
-        for work in self.after_textures.drain(..) {
-            work();
-        }
+        let _textures = crate::timeline::span("textures brought up to date");
+        // The time counted is the time it took, not the threads' sum.
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Ordering::Relaxed);
+        let due = std::mem::take(&mut self.due);
+        crate::shadow::wide_each(due.len(), move |i| due[i].refresh());
+        let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[2].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
 
     fn flush(&mut self) {
@@ -9256,8 +9232,15 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    /// The numbers panel (F3/F9), in every build.
     panel: panel::Panel,
+    /// The F1 settings menu.
+    menu: menu::Menu,
 }
+
+/// The frame rate the meter last counted, in tenths of a frame a second (0: none yet): for the
+/// line at the top of the picture (`menu.rs`).
+pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
@@ -9267,8 +9250,6 @@ struct Meter {
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
-    fg_shown: u64,
-    fg_on: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
@@ -9277,15 +9258,12 @@ struct Meter {
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
-        let (fg_shown, fg_on) = crate::streamline::fg_counters();
         Meter {
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
-            fg_shown,
-            fg_on,
             logged: now,
             caption: None,
         }
@@ -9312,20 +9290,12 @@ impl Meter {
             return;
         }
         let drawn = crate::draw::drawn();
-        let (fg_shown_now, fg_on_now) = crate::streamline::fg_counters();
-        let fg_shown_delta = fg_shown_now.saturating_sub(self.fg_shown) as f64;
-        let fg_on_delta = fg_on_now.saturating_sub(self.fg_on) as f64;
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
-        let fg_fps = if fg_on_delta > 0.0 && fg_shown_delta > fg_on_delta {
-            Some((fg_shown_delta + (frames - fg_on_delta).max(0.0)) / elapsed.as_secs_f64())
-        } else {
-            None
-        };
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn, self.fg_shown, self.fg_on) =
-            (std::time::Instant::now(), 0, drawn, fg_shown_now, fg_on_now);
+        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -9729,9 +9699,13 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = match fg_fps {
-            Some(fg) => format!(" | ALquerez {fg:.0} fps FG ({fps:.0} base) {ms:.1} ms/frame {draws:.0} draws/frame"),
-            None => format!(" | ALquerez {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+        // With frame generation showing more frames than are rendered, both rates.
+        let text = match crate::streamline::shown_per_frame() {
+            1 => format!(" | ALquerez {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+            per => format!(
+                " | ALquerez {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame",
+                fps * f64::from(per)
+            ),
         };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
@@ -9999,6 +9973,7 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10059,6 +10034,7 @@ impl Host {
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
             p.panel.frame(p.meter.line_due());
+            p.menu.frame();
             p.meter.frame(p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
@@ -10146,6 +10122,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(),
+                menu: menu::Menu::new(),
             })
         }
     }

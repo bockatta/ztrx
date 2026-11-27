@@ -3183,7 +3183,7 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 2, span * 2) } else { (per_frame, span) };
+        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -3786,17 +3786,14 @@ impl State {
                 .unwrap_or(u32::MAX),
             _ => 0,
         };
-        // Transparent surfaces (`MISS_ALPHA`: eyeglasses, glass windows, foam,
-        // wakes on water) read the opaque depth behind them, so we do NOT
-        // overwrite their reflection direction; instead we pass `alpha_clamp`
-        // (unless `VICTORY_AMBIENT_SPECULAR_ALPHA=1` requests full override) so
-        // `reflect_light` preserves 100% of outdoor water/glass reflections
-        // while clamping impossible 10-30x outdoor sky-cubemap blowouts indoors
-        // (e.g. glowing neon-white/sky-blue eyeglasses in dim rooms).
-        let alpha_full = std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1");
-        let is_alpha_clamp = role == Role::Miss && layer == crate::ambient::MISS_ALPHA && !alpha_full;
+        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA=1: its pixels
+        // are of transparent surfaces (glass, foam, wakes on water) and the
+        // depth read is the opaque one behind them; outdoors on water that is
+        // the bottom, the reflected direction is wrong and the estimate dark
+        // (play session 2026-11-27: dark patches on the water around a boat).
+        let alpha_too = std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1");
         if role == Role::Miss
-            && !(layer == crate::ambient::MISS_OPAQUE || layer == crate::ambient::MISS_ALPHA)
+            && !(layer == crate::ambient::MISS_OPAQUE || (alpha_too && layer == crate::ambient::MISS_ALPHA))
         {
             crate::ambient::note_miss(MissNote::Water);
             return false;
@@ -4029,7 +4026,6 @@ impl State {
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
             depth_size: [seen.Width as u32, seen.Height],
-            alpha_clamp: is_alpha_clamp,
         });
         if ran && role == Role::Miss {
             crate::ambient::note_miss(MissNote::Ran(layer));

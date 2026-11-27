@@ -278,12 +278,7 @@ void mean() {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    // On camera cuts or fade-ins from black, adapt quickly so background walls
-    // do not stay pitch black for seconds waiting on the slow moving average.
-    float old_l = dot(was.rgb, LUMA);
-    float new_l = dot(now, LUMA);
-    float rate = (new_l > old_l * 2.5 + 0.01 || old_l > new_l * 2.5 + 0.01) ? max(follow, 0.35) : follow;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, rate) : now, 1.0);
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
 }
 #endif
 
@@ -394,25 +389,15 @@ void reflect_light(uint3 at : SV_DispatchThreadID) {
         sum += wgt;
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    // Radiance from the first moments, with a smooth soft-knee rolloff so
-    // indoor glossy surfaces, skin and floors do not blow out into harsh chrome.
-    float3 found = all + 1.35 * float3(dot(sr.xyz, ray), dot(sg.xyz, ray), dot(sb.xyz, ray)) / sum;
-    found = clamp(found, 0.15 * all, 1.8 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.25) * level;
+    // Radiance from the first moments: three times the direction's share
+    // for an even spread of directions, a little less for a smooth image.
+    float3 found = all + 2.0 * float3(dot(sr.xyz, ray), dot(sg.xyz, ray), dot(sb.xyz, ray)) / sum;
+    found = clamp(found, 0.1 * all, 3.0 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level;
     found = any(isnan(found)) || any(isinf(found)) ? 0.0 : max(found, 0.0);
-    found *= 1.0 / (1.0 + dot(found, LUMA) * 0.65);
     float3 was = reflected[at.xy];
     was = any(isnan(was)) || any(isinf(was)) ? 0.0 : max(was, 0.0);
     float has = dot(was, LUMA);
-    if (constant > 1.5) {
-        // Transparent surfaces (eyeglasses, glass, water wakes): preserve the
-        // title's reflection hue & direction, only clamping impossible 10-30x
-        // outdoor sky-cubemap blowouts indoors down to match room lighting.
-        float room = max(dot(cells[CELLS].rgb, LUMA) * 2.2, dot(found, LUMA) * 1.8);
-        was *= min(1.0, max(room, 0.035) / max(has, 1e-6));
-        reflected[at.xy] = was;
-        return;
-    }
     was *= min(1.0, dot(found, LUMA) / max(has, 1e-6));
     reflected[at.xy] = lerp(found, was, constant);
 }
@@ -460,7 +445,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
             float over = dot(v, n) - 0.004 * c.z - 0.005;
             sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
         }
-        open = lerp(0.22, 1.0, saturate(1.0 - strength * 2.0 * sum / N));
+        open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
     if (constant > 0.0) {
@@ -487,12 +472,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
         sum += w;
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.15 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-    found = clamp(found, 0.30 * all, 2.2 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.25) * level;
-    // Gentle indoor fill floor so dark cutscene background walls and creases
-    // never crush to pitch black while preserving directional contrast & AO.
-    found = max(found, float3(0.020, 0.021, 0.024) * level) * open;
+    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = clamp(found, 0.2 * all, 2.5 * all);
+    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     float3 now = found;
     if (most > 0.0) {
@@ -613,9 +595,6 @@ pub(crate) struct Views {
     pub(crate) slices: u32,
     /// The size of the depth (the image's but for [`Role::Miss`]).
     pub(crate) depth_size: [u32; 2],
-    /// For [`Role::Miss`] on `MISS_ALPHA`: clamp indoor sky-cubemap blowouts
-    /// without overwriting outdoor water/glass reflection directions.
-    pub(crate) alpha_clamp: bool,
 }
 
 /// For the line every ten seconds: what the stand-in for reflections did.
@@ -716,7 +695,6 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     // The share of the estimate, and the constant (for reflections: the
     // share of the title's sky kept); the keep runs for either stand-in.
     let (level, constant) = match (role, set(), specular()) {
-        (Role::Miss, _, Some(s)) if views.alpha_clamp => (s.share, 2.0),
         (Role::Miss, _, Some(s)) => (s.share, s.sky),
         (Role::Miss, _, None) => return false,
         (Role::Radiance, Set::Off, Some(_)) => (0.0, 0.0),

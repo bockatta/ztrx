@@ -295,25 +295,6 @@ pub(crate) fn levels_changed_after(start: u64) {
 
 static RESHOWN_AFTER: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-/// Takes all placed-texture addresses whose first mapped tiled level just
-/// changed (for `descriptor::remake_views_now` before `ExecuteCommandLists`).
-pub(crate) fn take_reshown() -> Vec<u64> {
-    {
-        let mut after = RESHOWN_AFTER.lock().unwrap_or_else(|e| e.into_inner());
-        if !after.is_empty() {
-            let finished = crate::host::submissions().1;
-            let mut now = RESHOWN.lock().unwrap_or_else(|e| e.into_inner());
-            after.retain(|&(at, start)| {
-                if at <= finished {
-                    now.push(start);
-                }
-                at > finished
-            });
-        }
-    }
-    std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
 /// Slots that show a placed texture from another level than the title's view
 /// in them says now, and are made from that view when the upload it needs
 /// has run ([`HostHeap::texture_slot_flip`]).
@@ -1269,13 +1250,10 @@ impl TextureQueue {
                 if !again {
                     c[4] = c[4].max(frame.saturating_sub(w.written));
                 }
-                if again {
-                    // Already-uploaded slots waiting for a silent-write recheck go
-                    // in a dedicated 3rd tier strictly AFTER unuploaded fresh/again
-                    // textures so rechecks never starve new cutscene faces or walls.
-                    due.recheck.push((w.written, index, w.write, Some(w.checked)));
-                } else if w.looks > 0 || w.mapped > 0 {
-                    due.again.push((w.written, index, w.write));
+                if w.looks > 0 || w.mapped > 0 {
+                    // (Only these can wait for a look again: `recheck`
+                    // leaves a look, `partly` some bytes mapped.)
+                    due.again.push((w.written, index, w.write, Some(w.checked).filter(|c| c.2 != 0)));
                 } else {
                     due.fresh.push((w.written, index, w.write));
                 }
@@ -1311,9 +1289,8 @@ pub(crate) enum Told {
 /// [`TextureQueue::checked`] says of them, and of the others.
 #[derive(Default)]
 struct Due {
-    again: Vec<(u64, u32, u64)>,
+    again: Vec<(u64, u32, u64, Option<Checked>)>,
     fresh: Vec<(u64, u32, u64)>,
-    recheck: Vec<(u64, u32, u64, Option<Checked>)>,
 }
 
 impl Due {
@@ -1326,42 +1303,23 @@ impl Due {
     /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
     /// each when they were taken.
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
-        let Due { mut again, mut fresh, mut recheck } = self;
+        let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
         again.sort_unstable_by(|a, b| b.2.cmp(&a.2));
         fresh.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-        recheck.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(again.len() + fresh.len() + recheck.len()));
-        let mut known: Vec<Option<Checked>> = Vec::with_capacity(order.capacity());
-        for &(_, index, write) in again.iter().take(max) {
-            order.push((index, write));
-            known.push(None);
-        }
-        // Under heavy cutscene/scene-cut backlogs (>256 fresh textures), bias 3:1
-        // toward newest writes so currently visible characters & walls load first.
-        let newest_burst = if fresh.len() > 256 { 3 } else { 1 };
+        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
+        let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
-            for _ in 0..newest_burst {
-                if new < old && order.len() < max {
-                    order.push((fresh[new].1, fresh[new].2));
-                    known.push(None);
-                    new += 1;
-                }
-            }
+            order.push((fresh[new].1, fresh[new].2));
+            new += 1;
             if new < old && order.len() < max {
                 old -= 1;
                 order.push((fresh[old].1, fresh[old].2));
-                known.push(None);
             }
         }
-        for &(_, index, write, checked) in &recheck {
-            if order.len() >= max {
-                break;
-            }
-            order.push((index, write));
-            known.push(checked);
-        }
+        order.truncate(max);
+        known.resize(order.len(), None);
         (order, known)
     }
 }
@@ -2674,36 +2632,6 @@ impl HostHeap {
         remade
     }
 
-    /// Remakes SRVs for placed textures at `starts` whose first mapped tiled
-    /// level just changed right before `ExecuteCommandLists`.
-    pub(crate) fn texture_views_remade_for(&self, starts: &[u64]) -> usize {
-        if self.sampler || starts.is_empty() {
-            return 0;
-        }
-        let mut slots: Vec<u32> = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
-        };
-        slots.sort_unstable();
-        slots.dedup();
-        let mut remade = 0;
-        for slot in slots {
-            let _made = self.made.lock(slot);
-            let Some(key) = self.made.get(slot).filter(|&key| key != 0) else {
-                continue;
-            };
-            let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
-                continue;
-            };
-            if let Some(kept) = make(&view, self.at(slot)) {
-                self.put(slot);
-                self.keep(slot, kept);
-                remade += 1;
-            }
-        }
-        remade
-    }
-
     /// The memory of the texture title slot `index` views is not mapped
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
@@ -3485,36 +3413,6 @@ impl HostHeap {
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
-    }
-
-    /// Nullifies any slot currently holding one of the host texture pointers in
-    /// `textures` so `resource::let_go_idle` can safely reclaim VRAM from
-    /// unmapped/ancient chapter textures without leaving dangling views.
-    pub(crate) fn drop_views_of(&self, textures: &std::collections::HashSet<usize>) -> Vec<(u32, usize)> {
-        if self.sampler || textures.is_empty() {
-            return Vec::new();
-        }
-        let mut dropped = Vec::new();
-        for (index, mutex) in self.kept.iter().enumerate() {
-            let mut slot = mutex.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(raw) = slot.as_ref().map(|r| windows::core::Interface::as_raw(r) as usize) else {
-                continue;
-            };
-            if !textures.contains(&raw) {
-                continue;
-            }
-            let index = index as u32;
-            self.quick_is(index, 0);
-            self.made.set(index, 0);
-            null_view(self.at(index));
-            self.put(index);
-            self.clear_twin(index);
-            if let Some(old) = slot.take() {
-                crate::host::retire(old);
-            }
-            dropped.push((index, raw));
-        }
-        dropped
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.

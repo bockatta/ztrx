@@ -377,21 +377,8 @@ impl Tiled {
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost. And if a
-        // brand-new tiled texture has zero levels backed yet (`shown == MAX`),
-        // still grant its 64 KiB packed small-mip tail so characters/faces/eyes
-        // never render pitch black while waiting for room for full-res mips.
-        let packed_mask = if self.packed > 0 {
-            self.every_level() & !((1u32 << (self.standard.len() as u32).min(31)) - 1)
-        } else {
-            0
-        };
-        let must = if self.shown.load(Ordering::Relaxed) == u32::MAX {
-            card | (held & packed_mask)
-        } else {
-            card
-        };
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { must });
+        // waiting: a write of the card's into no memory is lost.
+        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
