@@ -64,8 +64,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    const TWELVE_GIB: u64 = 12 << 30;
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        // On <=12 GiB cards or <=32 GiB RAM hosts, keep spare empty 64 MiB blocks
+        // tight so idle pool blocks never starve DLSS/FrameGen or bloat RAM.
+        Some([budget, used, ..]) if keep && budget > TWELVE_GIB && !crate::residency::limited_host_ram() && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
     }
 }
@@ -564,6 +567,13 @@ pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
     let raw = texture.as_raw() as usize;
     let since = now().saturating_sub(1000);
     RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
+}
+
+/// Notes a freshly created host texture (including committed non-pooled
+/// textures) so `VICTORY_UPLOAD_AHEAD=1` can upload it asynchronously on the
+/// dedicated copy queue.
+pub(crate) fn note_fresh(texture: &ID3D12Resource) {
+    made_now(texture);
 }
 
 fn made_now(texture: &ID3D12Resource) {

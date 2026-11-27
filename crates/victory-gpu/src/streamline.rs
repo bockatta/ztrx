@@ -1834,6 +1834,12 @@ fn texture(
     made.ok_or_else(windows::core::Error::empty)
 }
 
+/// Cumulative frames actually presented by DLSS Frame Generation (`num_frames_actually_presented`)
+/// and cumulative presents made with Frame Generation active, for the HUD panel and window caption.
+pub(crate) fn fg_counters() -> (u64, u64) {
+    (FG_SHOWN_ALL.load(Relaxed), FG_ON_ALL.load(Relaxed))
+}
+
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     let Some(plan) = PLAN.get() else { return };

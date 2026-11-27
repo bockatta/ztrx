@@ -32,9 +32,9 @@ pub(crate) const LISTED: u8 = 3;
 
 /// Bytes of title memory on their way at most: past it uploads go into the
 /// lists, as before.
-const MOST: u64 = 96 << 20;
+const MOST: u64 = 128 << 20;
 /// Bytes and textures of one submission at most.
-const BATCH: (u64, usize) = (16 << 20, 64);
+const BATCH: (u64, usize) = (24 << 20, 96);
 
 /// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
 pub(crate) fn on() -> bool {
@@ -104,7 +104,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
+    let most = if crate::residency::limited_host_ram() { 64 << 20 } else { MOST };
     if !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0
@@ -203,7 +203,11 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            let threads = std::env::var("VICTORY_UPLOAD_AHEAD_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map_or(4, |n| n.clamp(1, 8));
+            for n in 0..threads {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }

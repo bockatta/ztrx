@@ -175,7 +175,7 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
 #[derive(Clone, Copy, Default)]
 struct Counters([u64; COUNTERS]);
 
-const COUNTERS: usize = 11;
+const COUNTERS: usize = 13;
 
 #[cfg(not(feature = "diagnostics"))]
 fn process_memory() -> (u64, u64) {
@@ -208,6 +208,7 @@ impl Counters {
         let record_ns = crate::copystat::peek(crate::copystat::C::RecordNs);
         #[cfg(not(feature = "diagnostics"))]
         let record_ns = 0;
+        let (fg_shown, fg_on) = crate::streamline::fg_counters();
         Counters([
             super::worked(),
             get(&CARD_CLOCK_US[0]),
@@ -220,6 +221,8 @@ impl Counters {
             crate::draw::dropped_now(),
             record_ns,
             crate::draw::drawn(),
+            fg_shown,
+            fg_on,
         ])
     }
 
@@ -244,8 +247,18 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let (working, private) = process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
+    let base_fps = 1e3 / ms.max(0.001);
+    let fg_shown = c[11];
+    let fg_on = c[12];
+    let headline = if fg_on > 0.01 && fg_shown > fg_on {
+        // Total frames shown per title present = DLSS-G shown frames + non-FG presents.
+        let shown_fps = base_fps * (fg_shown + (1.0 - fg_on).max(0.0));
+        format!("FPS {shown_fps:.1} FG  BASE {base_fps:.1}  {ms:.1} MS")
+    } else {
+        format!("FPS {base_fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}")
+    };
     vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
+        headline,
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),

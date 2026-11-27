@@ -2279,6 +2279,7 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
+    let (evicted, waits) = evict_slot_held(&all, idle_ms, IDLE_FRAMES);
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
     if most != u64::MAX {
@@ -2309,13 +2310,20 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in evicted
+        .iter()
+        .copied()
+        .chain(all.range(from..).take(part).copied())
+        .chain(by_age.iter().map(|&(_, at)| at))
+    {
         if bytes >= most {
             break;
         }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+        if !evicted.contains(&at) {
+            looked += 1;
+            if part == PART {
+                FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+            }
         }
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
@@ -2330,7 +2338,7 @@ pub(crate) fn let_go_idle() {
             let idle = made.as_ref().is_some_and(|(host, _)| {
                 crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
+                    && (crate::host::references(&host.texture) == 1 || evicted.contains(&at))
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -2357,6 +2365,11 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    let slots = waits.len();
+    crate::descriptor::note_waiting(waits);
+    if slots > 0 {
+        EVICTED_SLOTS.fetch_add(slots as u64, Relaxed);
+    }
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2366,6 +2379,141 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Slots [`evict_slot_held`] let go since the start.
+#[cfg(windows)]
+pub(crate) static EVICTED_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 2-Tier Safe VRAM Eviction under pressure:
+/// - Tier 1 (`VICTORY_EVICT_UNMAPPED=1`, default ON): reclaims placed textures
+///   whose title memory GTA VI itself unmapped (`mapped_bytes == 0`), freeing
+///   dead chapter/menu textures without touching live assets.
+/// - Tier 2 (`VICTORY_EVICT_OLD_MS=45000`, default 45s / 180 frames untouched):
+///   when VRAM is still critically full (`>= 90%` or `!room`), reclaims oldest
+///   ancient-idle textures (max 256 MiB/sweep) so DLSS/FrameGen and new cutscene
+///   character textures never hit `out of VRAM` or render pitch black.
+#[cfg(windows)]
+fn evict_slot_held(
+    all: &std::collections::BTreeSet<usize>,
+    idle_ms: u64,
+    idle_frames: u64,
+) -> (std::collections::HashSet<usize>, Vec<(usize, u64)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST: u64 = 512 << 20;
+    const ANCIENT_MOST: u64 = 256 << 20;
+    const ANCIENT_FRAMES: u64 = 180;
+    static EVICT_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static EVICT_UNMAPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static EVICT_OLD_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let evict_all = *EVICT_ALL.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_EVICT").is_some_and(|v| v == "1"));
+    let evict_unmapped = *EVICT_UNMAPPED.get_or_init(|| std::env::var_os("VICTORY_EVICT_UNMAPPED").is_none_or(|v| v != "0"));
+    let evict_old_ms = *EVICT_OLD_MS.get_or_init(|| {
+        std::env::var("VICTORY_EVICT_OLD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(45_000)
+    });
+    let none = (std::collections::HashSet::new(), Vec::new());
+    if !evict_all && !evict_unmapped && evict_old_ms == 0 {
+        return none;
+    }
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    // Tier 1 (unmapped dead textures) runs once VRAM reaches 84% or `room`
+    // closes so cutscene/menu churn stays lean without ever evicting live art.
+    // Tier 2 (ancient idle textures) is an emergency safety valve at >= 94%
+    // actual physical VRAM so normal cutscene play never thrashes live rigs.
+    let pressed = !room(video)
+        || video.is_some_and(|[budget, used, ..]| budget > 0 && used >= budget * 84 / 100);
+    if !pressed {
+        return none;
+    }
+    let critical = video.is_some_and(|[budget, used, ..]| budget > 0 && used >= budget * 94 / 100);
+    let mut by_texture = std::collections::HashMap::new();
+    let mut bytes = 0u64;
+    let mut unmapped_bytes = 0u64;
+    let mut ancient_candidates: Vec<(u64, usize, usize, u64)> = Vec::new();
+    for &at in all {
+        if bytes >= MOST {
+            break;
+        }
+        // SAFETY: as in `let_go_idle`, under the same table lock.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let used = r.host.used.load(Relaxed);
+        if used == 0 {
+            continue;
+        }
+        let is_unmapped = if evict_all {
+            true
+        } else if evict_unmapped && r.host.placed.load(Relaxed) {
+            let ptr = r.data().cast_const();
+            !ptr.is_null()
+                && !crate::texture::committed(ptr, 1)
+                && crate::texture::mapped_bytes(ptr, texture_layout(&r.desc).map_or(4096, |t| t.size as usize).max(1)) == 0
+        } else {
+            false
+        };
+        if is_unmapped {
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((host, _)) = made.as_ref()
+                && crate::host::long_ago(used, idle_ms, idle_frames)
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) > 1
+            {
+                let b = host.tiled.as_ref().map_or(host.bytes, |t| t.given_bytes());
+                by_texture.insert(windows::core::Interface::as_raw(&host.texture) as usize, at);
+                bytes += b.max(64 << 10);
+                unmapped_bytes += b.max(64 << 10);
+            }
+        } else if critical
+            && evict_old_ms > 0
+            && crate::host::long_ago(used, evict_old_ms, ANCIENT_FRAMES)
+        {
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((host, _)) = made.as_ref()
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) > 1
+            {
+                let b = host.tiled.as_ref().map_or(host.bytes, |t| t.given_bytes());
+                ancient_candidates.push((
+                    used & 0xffff_ffff,
+                    windows::core::Interface::as_raw(&host.texture) as usize,
+                    at,
+                    b.max(64 << 10),
+                ));
+            }
+        }
+    }
+    let mut ancient_bytes = 0u64;
+    if critical && unmapped_bytes < (192 << 20) && !ancient_candidates.is_empty() {
+        ancient_candidates.sort_unstable_by_key(|c| c.0);
+        for (_, raw, at, b) in ancient_candidates {
+            if bytes >= MOST || ancient_bytes >= ANCIENT_MOST {
+                break;
+            }
+            if by_texture.insert(raw, at).is_none() {
+                bytes += b;
+                ancient_bytes += b;
+            }
+        }
+    }
+    if by_texture.is_empty() {
+        return none;
+    }
+    let raws: std::collections::HashSet<usize> = by_texture.keys().copied().collect();
+    let dropped = crate::descriptor::drop_views_of(&raws);
+    let mut evicted = std::collections::HashSet::with_capacity(by_texture.len());
+    let mut waits = Vec::with_capacity(dropped.len());
+    for (handle, raw) in dropped {
+        if let Some(&at) = by_texture.get(&raw) {
+            evicted.insert(at);
+            waits.push((at, handle));
+        }
+    }
+    (evicted, waits)
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2711,8 +2859,11 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). Reserved textures (`VICTORY_LEVELS_ON_DEMAND=1`) must
+    // skip the committed pool so `CreateReservedResource` allocates only the
+    // mip levels the title actually mapped.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2776,6 +2927,9 @@ fn host_texture_as(
         texture = None;
     }
     if let Some(t) = &texture {
+        if !reserved && fills(desc) && crate::host::texture_state(state) == 0 {
+            crate::pool::note_fresh(t);
+        }
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });

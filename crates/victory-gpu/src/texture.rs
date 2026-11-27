@@ -926,7 +926,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     };
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
+    list.defer_after_textures(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
